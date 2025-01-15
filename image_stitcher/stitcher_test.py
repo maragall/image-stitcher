@@ -33,7 +33,6 @@ class StitcherTest(unittest.TestCase):
             self.assertIsNotNone(output_filename)
 
             im = next(Reader(parse_url(output_filename))()).data[0]
-            print(im[0, 0, 0, 0, 1])
             self.assertEqual(im.shape, (1, 3, 1, 3000, 3000))
             self.assertEqual(im[0, 0, 0, 0, 0].compute(), 0)
             self.assertEqual(im[0, 0, 0, 1000, 0].compute(), 3)
