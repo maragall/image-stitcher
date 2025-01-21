@@ -2,9 +2,10 @@
 
 ## Run the GUI
 
-On linux (e.g. ubuntu), ensure you have the necessary system dependencies
-installed. We provide a setup script for ubuntu 22.04 LTS that does this
-automatically:
+### Pre-setup for linux (e.g. ubuntu)
+
+On linux, ensure you have the necessary system dependencies installed. We
+provide a setup script for ubuntu 22.04 LTS that does this automatically:
 
 ```
 ./setup_ubuntu_22_04.sh
@@ -12,8 +13,12 @@ automatically:
 for other distributions / versions, the exact packages may be slightly
 different.
 
+### Pre-setup for mac OS
+
 On mac OS, make sure you have `curl` installed (e.g. `brew install curl`) if
 you don't already.
+
+### Run the GUI
 
 Then either double click the `run_gui` script or from this repository's directory run:
 ```
