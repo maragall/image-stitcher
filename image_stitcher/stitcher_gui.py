@@ -83,7 +83,7 @@ class StitchingGUI(QWidget):
         self.layout.addWidget(self.outputFormatCombo)  # type: ignore
 
         self.compressionLabel = QLabel("Output compression", self)
-        self.layout.addWidget(self.compressionLabel)
+        self.layout.addWidget(self.compressionLabel)  # type: ignore
         self.outputCompression = QComboBox(self)
         self.outputCompression.addItems(["default", "none"])
         self.layout.addWidget(self.outputCompression)  # type: ignore
@@ -91,17 +91,17 @@ class StitchingGUI(QWidget):
         self.pyramidCheckbox = QCheckBox("Infer levels for output image pyramid", self)
         self.pyramidCheckbox.setChecked(True)
         self.pyramidCheckbox.toggled.connect(self.onPyramidChange)
-        self.layout.addWidget(self.pyramidCheckbox)
+        self.layout.addWidget(self.pyramidCheckbox)  # type: ignore
 
         self.pyramidLabel = QLabel(
             "Number of output levels for the image pyramid", self
         )
-        self.layout.addWidget(self.pyramidLabel)
+        self.layout.addWidget(self.pyramidLabel)  # type: ignore
         self.pyramidLabel.hide()
         self.pyramidLevels = QSpinBox(self)
         self.pyramidLevels.setMaximum(32)
         self.pyramidLevels.setMinimum(1)
-        self.layout.addWidget(self.pyramidLevels)
+        self.layout.addWidget(self.pyramidLevels)  # type: ignore
         self.pyramidLevels.hide()
 
         # Status label
@@ -170,7 +170,7 @@ class StitchingGUI(QWidget):
             if self.outputFormatCombo.currentText() == "OME-ZARR":
                 if not self.pyramidCheckbox.isChecked():
                     params.num_pyramid_levels = self.pyramidLevels.value()
-                params.output_compression = self.outputCompression.currentText()
+                params.output_compression = self.outputCompression.currentText()  # type: ignore
 
             self.stitcher = StitcherThread(
                 Stitcher(
