@@ -78,7 +78,6 @@ class StitchingGUI(QWidget):
         self.outputFormatCombo = QComboBox()
         self.outputFormatCombo.addItems(["OME-ZARR", "OME-TIFF"])
         self.layout.addWidget(self.outputFormatCombo)  # type: ignore
-        self.outputFormatCombo.currentTextChanged.connect(self.onOutputFormatChanged)
 
         # Status label
         self.statusLabel = QLabel("Status: Ready", self)
@@ -210,14 +209,6 @@ class StitchingGUI(QWidget):
     def onErrorOccurred(self, error: Any) -> None:
         QMessageBox.critical(self, "Error", f"Error while processing: {error}")
         self.statusLabel.setText("Error Occurred!")
-
-    def onOutputFormatChanged(self) -> None:
-        is_zarr = self.outputFormatCombo.currentText() == "OME-ZARR"
-        self.mergeTimepointsCheck.setEnabled(is_zarr)
-        self.mergeRegionsCheck.setEnabled(is_zarr)
-        if not is_zarr:
-            self.mergeTimepointsCheck.setChecked(False)
-            self.mergeRegionsCheck.setChecked(False)
 
     def onViewOutput(self) -> None:
         output_path = self.outputPathEdit.text()
