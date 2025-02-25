@@ -4,7 +4,7 @@ import os
 import pathlib
 import tempfile
 from datetime import datetime, timezone
-from typing import Generator
+from typing import Generator, Optional
 
 import numpy as np
 import pandas as pd
@@ -33,9 +33,10 @@ def temporary_image_directory_params(
     channel_names: list[str],
     name: str = "image_inputs",
     step_mm: tuple[float, float] = (3.2, 3.2),
-    sensor_pixel_size_µm: float = 7.52,
+    sensor_pixel_size_um: float = 7.52,
     magnification: float = 20.0,
     disk_based_output_arr: bool = False,
+    pyramid_levels: Optional[int] = None
 ) -> Generator[StitchingComputedParameters, None, None]:
     """Set up the files that the computed parameters requires for setup.
 
@@ -81,7 +82,7 @@ def temporary_image_directory_params(
                 )
                 for ch in channel_names:
                     im_file = base_dir / "0" / image_filename(fov_counter, ch)
-                    skimage.io.imsave(im_file, make_fake_image(fov_counter))
+                    skimage.io.imsave(im_file, make_fake_image(fov_counter), check_contrast=False)
                 fov_counter += 1
 
         coords = pd.DataFrame(coordinates)
@@ -104,7 +105,7 @@ def temporary_image_directory_params(
                 "tube_lens_f_mm": 180.0,
                 "name": "20x",
             },
-            "sensor_pixel_size_um": sensor_pixel_size_μm,
+            "sensor_pixel_size_um": sensor_pixel_size_um,
             "tube_lens_mm": 180,
         }
 
@@ -112,6 +113,8 @@ def temporary_image_directory_params(
             json.dump(acq_params, f)
 
         base_params = StitchingParameters.from_json_file(str(PARAMETERS_FIXTURE_FILE))
+        if pyramid_levels:
+            base_params.num_pyramid_levels = pyramid_levels
         if disk_based_output_arr:
             base_params.force_stitch_to_disk = True
         base_params.input_folder = str(base_dir)
