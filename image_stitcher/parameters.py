@@ -6,7 +6,7 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Any, ClassVar, Literal, NamedTuple, Union
+from typing import Annotated, Any, ClassVar, Literal, NamedTuple, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -83,6 +83,9 @@ class StitchingParameters(
 
     apply_flatfield: bool = False
     """Whether to apply a flatfield correction to the images prior to stitching."""
+
+    flatfield_manifest: Optional[pathlib.Path] = None
+    """If set, a path (folder or .json) from which to load precomputed flatfields."""
 
     verbose: bool = False
     """Show debug-level logging."""

@@ -228,6 +228,7 @@ class Stitcher:
                 f"Unexpected stitched_region shape: {stitched_region.shape}. Expected 5D array (t, c, z, y, x)."
             )
         if self.params.apply_flatfield:
+            logging.debug("Applying flatfield to channel_idx: %s", channel_idx)
             tile = self.apply_flatfield_correction(tile, channel_idx)
 
         # Calculate end points based on stitched_region shape
@@ -541,11 +542,59 @@ class Stitcher:
         self.paths.output_folder.mkdir(exist_ok=True, parents=True)
 
         if self.params.apply_flatfield:
-            self.computed_parameters.flatfields = (
-                flatfield_correction.compute_flatfield_correction(
-                    self.computed_parameters, self.callbacks.getting_flatfields
+            # either load an existing manifest…
+            if self.params.flatfield_manifest:
+                from .flatfield_utils import load_flatfield_correction
+
+                self.computed_parameters.flatfields = load_flatfield_correction(
+                    self.params.flatfield_manifest,
+                    self.computed_parameters,
                 )
-            )
+            # …or compute afresh
+            else:
+                self.computed_parameters.flatfields = (
+                    flatfield_correction.compute_flatfield_correction(
+                        self.computed_parameters,
+                        self.callbacks.getting_flatfields,
+                    )
+                )
+
+            # Validate loaded/computed flatfields
+            if self.computed_parameters.flatfields:
+                expected_shape = (
+                    self.computed_parameters.input_height,
+                    self.computed_parameters.input_width,
+                )
+                # Iterate over a copy of keys for safe removal during iteration
+                for ch_idx in list(self.computed_parameters.flatfields.keys()):
+                    ff_array = self.computed_parameters.flatfields[ch_idx]
+                    if not isinstance(ff_array, np.ndarray):
+                        logging.warning(
+                            f"Flatfield for channel index {ch_idx} is not a numpy array (type: {type(ff_array)}). "
+                            "This flatfield will not be used."
+                        )
+                        del self.computed_parameters.flatfields[ch_idx]
+                        continue # Skip to next flatfield
+
+                    if ff_array.ndim != 2 or ff_array.shape != expected_shape:
+                        logging.warning(
+                            f"Flatfield for channel index {ch_idx} has incorrect shape {ff_array.shape}. "
+                            f"Expected 2D array of shape {expected_shape}. "
+                            "This flatfield will not be used."
+                        )
+                        del self.computed_parameters.flatfields[ch_idx]
+                    # Optional: Add further checks like dtype or value range if necessary
+
+            # Log loaded/computed AND VALIDATED flatfield indices here
+            if self.computed_parameters.flatfields:
+                logging.debug(
+                    "Validated and using flatfields for channel indices: %s",
+                    list(self.computed_parameters.flatfields.keys()),
+                )
+            else:
+                logging.debug(
+                    "Flatfield application was enabled, but no valid flatfields were loaded, computed, or passed validation."
+                )
 
         # Initialize z-layer selector
         self.z_selector = create_z_layer_selector(self.params.z_layer_selection)
@@ -572,7 +621,9 @@ class Stitcher:
                 stitched_region = self.stitch_region(timepoint, region)
                 with debug_timing("rechunking"):
                     chunk_shapes = self.computed_parameters.chunks
-                    logging.debug(f"Re-chunking to make region has {chunk_shapes} chunks.")
+                    logging.debug(
+                        f"Re-chunking to make region has {chunk_shapes} chunks."
+                    )
                     if isinstance(stitched_region, np.ndarray):
                         dask_stitched_region = da.from_array(
                             stitched_region,
