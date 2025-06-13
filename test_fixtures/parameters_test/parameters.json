@@ -4,6 +4,7 @@
   "scan_pattern": "Unidirectional",
   "z_layer_selection": "middle",
   "apply_flatfield": false,
+  "apply_mip": false,
   "flatfield_manifest": null,
   "verbose": false,
   "force_stitch_to_disk": false,

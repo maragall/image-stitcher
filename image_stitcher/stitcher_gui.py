@@ -167,6 +167,10 @@ class StitchingGUI(QWidget):
         self.zLayerSpinBox.setVisible(False)
         self.layout.addWidget(self.zLayerSpinBox)  # type: ignore
 
+        self.mipCheckbox = QCheckBox("Apply Maximum Intensity Projection (MIP)", self)
+        self.mipCheckbox.setChecked(False)
+        self.layout.addWidget(self.mipCheckbox)
+
         self.pyramidLabel = QLabel(
             "Number of output levels for the image pyramid", self
         )
@@ -277,6 +281,7 @@ class StitchingGUI(QWidget):
                 scan_pattern=ScanPattern.unidirectional,
                 z_layer_selection=z_layer_selection_value,
                 apply_flatfield=self.flatfieldCorrectCheckbox.isChecked(),
+                apply_mip=self.mipCheckbox.isChecked(),
             )
 
             if output_format == OutputFormat.ome_zarr:
