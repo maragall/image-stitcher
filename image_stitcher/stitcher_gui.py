@@ -1,8 +1,8 @@
 import logging
 import sys
+import enum
 from typing import Any, cast, Union
 import pathlib
-import enum
 
 import napari
 import numpy as np
@@ -30,14 +30,16 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from image_stitcher.parameters import (
+from .parameters import (
     DATETIME_FORMAT,
     OutputFormat,
     ScanPattern,
     StitchingParameters,
     ZLayerSelection,
 )
-from image_stitcher.stitcher import ProgressCallbacks, Stitcher
+from .stitcher import ProgressCallbacks, Stitcher
+from .registration import register_and_update_coordinates
+
 
 # Enum for Flatfield Modes
 class FlatfieldModeOption(enum.Enum):
@@ -80,6 +82,33 @@ class StitcherThread(QThread):
         self.inner.run()
 
 
+class RegistrationThread(QThread):
+    def __init__(self, image_directory: str, csv_path: str, output_csv_path: str) -> None:
+        super().__init__()
+        self.image_directory = image_directory
+        self.csv_path = csv_path
+        self.output_csv_path = output_csv_path
+
+    def run(self) -> None:
+        try:
+            register_and_update_coordinates(
+                image_directory=self.image_directory,
+                csv_path=self.csv_path,
+                output_csv_path=self.output_csv_path,
+                channel_pattern=None,  # Auto-detect
+                overlap_diff_threshold=10,
+                pou=3,
+                ncc_threshold=0.5,
+                skip_backup=False,
+                z_slice_for_registration=0,
+                edge_width=256
+            )
+        except Exception as e:
+            self.error.emit(str(e))
+
+    error = Signal(str)
+
+
 class StitchingGUI(QWidget):
     # Signals for progress indicators. QT dictates these must be defined at the class level.
     update_progress = Signal(int, int)
@@ -98,6 +127,7 @@ class StitchingGUI(QWidget):
         self.stitcher: StitcherThread | None = (
             None  # Stitcher is initialized when needed
         )
+        self.registration_thread: RegistrationThread | None = None
         self.inputDirectory: str | None = (
             None  # This will be set by the directory selection
         )
@@ -113,6 +143,11 @@ class StitchingGUI(QWidget):
         self.inputDirectoryBtn = QPushButton("Select Input Directory", self)
         self.inputDirectoryBtn.clicked.connect(self.selectInputDirectory)
         self.layout.addWidget(self.inputDirectoryBtn)  # type: ignore
+
+        # Registration button
+        self.registerBtn = QPushButton("Register Images", self)
+        self.registerBtn.clicked.connect(self.onRegistrationStart)
+        self.layout.addWidget(self.registerBtn)  # type: ignore
 
         # Output format combo box (full width)
         self.outputFormatCombo = QComboBox(self)
@@ -263,6 +298,7 @@ class StitchingGUI(QWidget):
             return
 
         try:
+            # Create parameters from UI state
             format_text = self.outputFormatCombo.currentText()
             if format_text == "OME-ZARR":
                 output_format = OutputFormat.ome_zarr
@@ -272,6 +308,10 @@ class StitchingGUI(QWidget):
                 QMessageBox.critical(self, "Internal Error", f"Invalid output format selected: {format_text}")
                 return
 
+            flatfield_mode = get_flatfield_mode_from_string(self.flatfieldModeCombo.currentText())
+            apply_flatfield = flatfield_mode != FlatfieldModeOption.NONE
+            flatfield_manifest = self.flatfield_manifest if flatfield_mode == FlatfieldModeOption.LOAD else None
+
             # Determine z-layer selection strategy
             z_layer_selection_value = self._get_z_layer_selection_value()
 
@@ -279,8 +319,9 @@ class StitchingGUI(QWidget):
                 input_folder=self.inputDirectory,
                 output_format=output_format,
                 scan_pattern=ScanPattern.unidirectional,
+                apply_flatfield=apply_flatfield,
+                flatfield_manifest=flatfield_manifest,
                 z_layer_selection=z_layer_selection_value,
-                apply_flatfield=self.flatfieldCorrectCheckbox.isChecked(),
                 apply_mip=self.mipCheckbox.isChecked(),
             )
 
@@ -491,6 +532,66 @@ class StitchingGUI(QWidget):
             (channel_info["hex"] & 0xFF) / 255,
         )  # Normalize the Blue component
         return Colormap(colors=[c0, c1], controls=[0, 1], name=channel_info["name"])
+
+    def onRegistrationStart(self) -> None:
+        """Start registration from GUI."""
+        if not self.inputDirectory:
+            QMessageBox.warning(
+                self, "Input Error", "Please select an input directory."
+            )
+            return
+
+        try:
+            # Find coordinates.csv in the input directory
+            csv_path = pathlib.Path(self.inputDirectory) / "coordinates.csv"
+            if not csv_path.exists():
+                QMessageBox.warning(
+                    self, "Input Error", "No coordinates.csv found in the input directory."
+                )
+                return
+
+            # Create output path for updated coordinates
+            output_csv_path = csv_path.parent / f"{csv_path.stem}_registered{csv_path.suffix}"
+
+            # Start registration in a separate thread
+            self.registration_thread = RegistrationThread(
+                image_directory=self.inputDirectory,
+                csv_path=str(csv_path),
+                output_csv_path=str(output_csv_path)
+            )
+            self.registration_thread.error.connect(self.onRegistrationError)
+            self.registration_thread.finished.connect(self.onRegistrationFinished)
+
+            # Update UI
+            self.statusLabel.setText("Status: Registering images...")
+            self.registerBtn.setEnabled(False)
+            self.progressBar.setRange(0, 0)  # Indeterminate progress
+            self.progressBar.show()
+
+            # Start registration
+            self.registration_thread.start()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Registration Error", str(e))
+            self.statusLabel.setText("Status: Error Encountered")
+
+    def onRegistrationError(self, error_msg: str) -> None:
+        """Handle registration errors."""
+        QMessageBox.critical(self, "Registration Error", error_msg)
+        self.statusLabel.setText("Status: Error Encountered")
+        self.registerBtn.setEnabled(True)
+        self.progressBar.hide()
+
+    def onRegistrationFinished(self) -> None:
+        """Handle completion of registration."""
+        self.statusLabel.setText("Status: Registration completed")
+        self.registerBtn.setEnabled(True)
+        self.progressBar.hide()
+        QMessageBox.information(
+            self,
+            "Registration Complete",
+            "Image registration has been completed successfully."
+        )
 
 
 if __name__ == "__main__":

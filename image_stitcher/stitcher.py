@@ -344,12 +344,8 @@ class Stitcher:
                     (first_tile_info.y - y_min) * 1000 / self.computed_parameters.pixel_size_um
                 )
 
-                # Map z_level to output array index
-                output_z_level = z_index_map[z_level]
-
-                self.place_tile(
-                    stitched_region, mip_tile, x_pixel, y_pixel, output_z_level, channel
-                )
+                # Place MIP tile at z_level=0 (since we only have 1 z-level in output)
+                self.place_tile(stitched_region, mip_tile, x_pixel, y_pixel, 0, channel)
 
                 self.callbacks.update_progress(processed_tiles, total_tiles)
                 processed_tiles += len(z_tiles)
@@ -743,4 +739,4 @@ class Stitcher:
         # Loop over timepoints and regions
         for t_idx, t in enumerate(self.computed_parameters.timepoints):
             for r_idx, region in enumerate(self.computed_parameters.regions):
-                self.stitch_region(t, r)
+                self.stitch_region(t, region)

@@ -7,7 +7,6 @@ import pathlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Literal, NamedTuple, Optional, Union
-
 import numpy as np
 import pandas as pd
 from dask_image.imread import imread as dask_imread
