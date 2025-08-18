@@ -117,6 +117,17 @@ class Stitcher:
         else:
             raise ValueError(f"Unexpected tile shape: {tiles[0].shape}")
 
+    def load_image(self, tile_info) -> np.ndarray:
+        """Load an image from file, handling both single files and multi-page TIFF files."""
+        if hasattr(tile_info, 'frame_idx') and tile_info.frame_idx > 0:
+            # Multi-page TIFF file
+            import tifffile
+            with tifffile.TiffFile(tile_info.filepath) as tif:
+                return tif.pages[tile_info.frame_idx].asarray()
+        else:
+            # Single file
+            return skimage.io.imread(tile_info.filepath)
+
     def create_output_array(
         self, timepoint: int, region: str, num_z_layers: int
     ) -> AnyArray:
@@ -329,7 +340,7 @@ class Stitcher:
                 # The order of tiles does not matter for compute_mip
                 tiles = []
                 for z_level, tile_info in z_tiles:
-                    tile = skimage.io.imread(tile_info.filepath)
+                    tile = self.load_image(tile_info)
                     tiles.append(tile)
                 
                 # Compute MIP
@@ -353,7 +364,7 @@ class Stitcher:
             # Original processing logic for non-MIP case
             for key, tile_info in self.metadata.items():
                 t, _, _, z_level, channel = key
-                tile = skimage.io.imread(tile_info.filepath)
+                tile = self.load_image(tile_info)
 
                 x_pixel = int(
                     (tile_info.x - x_min) * 1000 / self.computed_parameters.pixel_size_um
