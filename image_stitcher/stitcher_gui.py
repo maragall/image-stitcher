@@ -342,20 +342,68 @@ class StitchingGUI(QWidget):
             return
 
         self.inputDirectory = str(acquisition_dir)
-        # Visually mark the drop area
-        self.inputDirDropArea.setText(f"Loaded: {acquisition_dir.name}")
-        self.inputDirDropArea.setStyleSheet("""
-            QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}
-        """)
-        self.probeDatasetForZLayers()
+        
+        # Detect and display the acquisition format
+        try:
+            temp_params = StitchingParameters(
+                input_folder=self.inputDirectory,
+                output_format=OutputFormat.ome_zarr, 
+                scan_pattern=ScanPattern.unidirectional,
+            )
+            temp_stitcher = Stitcher(temp_params)
+            
+            # Check if it's multi-page TIFF format
+            if temp_stitcher.computed_parameters.is_multipage_tiff_format():
+                format_info = " (Multi-page TIFF)"
+            else:
+                format_info = " (Individual files)"
+                
+            # Visually mark the drop area
+            self.inputDirDropArea.setText(f"Loaded: {acquisition_dir.name}{format_info}")
+            self.inputDirDropArea.setStyleSheet("""
+                QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}
+            """)
+            self.probeDatasetForZLayers()
+            
+        except Exception as e:
+            logging.warning(f"Could not detect acquisition format: {e}")
+            # Fallback to original behavior
+            self.inputDirDropArea.setText(f"Loaded: {acquisition_dir.name}")
+            self.inputDirDropArea.setStyleSheet("""
+                QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}
+            """)
+            self.probeDatasetForZLayers()
 
     def selectInputDirectory(self) -> None: # Kept for now, can be removed if button is fully replaced
         dir = QFileDialog.getExistingDirectory(self, "Select Input Image Folder")
         if dir:
             self.inputDirectory = dir
-            self.inputDirDropArea.setText(f"Loaded: {pathlib.Path(dir).name}")
-            self.inputDirDropArea.setStyleSheet("""QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}""")
-            self.probeDatasetForZLayers()
+            
+            # Detect and display the acquisition format
+            try:
+                temp_params = StitchingParameters(
+                    input_folder=self.inputDirectory,
+                    output_format=OutputFormat.ome_zarr, 
+                    scan_pattern=ScanPattern.unidirectional,
+                )
+                temp_stitcher = Stitcher(temp_params)
+                
+                # Check if it's multi-page TIFF format
+                if temp_stitcher.computed_parameters.is_multipage_tiff_format():
+                    format_info = " (Multi-page TIFF)"
+                else:
+                    format_info = " (Individual files)"
+                    
+                self.inputDirDropArea.setText(f"Loaded: {pathlib.Path(dir).name}{format_info}")
+                self.inputDirDropArea.setStyleSheet("""QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}""")
+                self.probeDatasetForZLayers()
+                
+            except Exception as e:
+                logging.warning(f"Could not detect acquisition format: {e}")
+                # Fallback to original behavior
+                self.inputDirDropArea.setText(f"Loaded: {pathlib.Path(dir).name}")
+                self.inputDirDropArea.setStyleSheet("""QLabel {border: 2px solid green; border-radius: 5px; background-color: #e0ffe0;}""")
+                self.probeDatasetForZLayers()
 
     def probeDatasetForZLayers(self) -> None:
         if not self.inputDirectory:
