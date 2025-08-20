@@ -1,6 +1,7 @@
 import logging
 import sys
 import enum
+import os
 from typing import Any, cast, Union
 import pathlib
 
@@ -311,7 +312,7 @@ class StitchingGUI(QWidget):
         self.startBtn.clicked.connect(self.onStitchingStart)
         self.mainLayout.addWidget(self.startBtn, 11, 0)
 
-        self.viewBtn = QPushButton("View Output in Napari", self)
+        self.viewBtn = QPushButton("View Output", self)
         self.viewBtn.clicked.connect(self.onViewOutput)
         self.viewBtn.setEnabled(False)
         self.mainLayout.addWidget(self.viewBtn, 11, 1)
@@ -634,10 +635,226 @@ class StitchingGUI(QWidget):
         self.statusLabel.setText("Error Occurred!")
 
     def onViewOutput(self) -> None:
+        """Handle the 'View Output' button click.
+        
+        This method intelligently determines whether to launch the HCS Grid Viewer
+        (for wellplate datasets with multiple timepoints) or open directly in Napari
+        (for single files or single timepoint datasets).
+        """
+        # Configure logging to see debug output
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        
         output_path = self.output_path
+        logging.info(f"onViewOutput called with output_path: {output_path}")
+        
         if not output_path:
             QMessageBox.warning(self, "View Error", "No output path set. Has stitching completed?")
             return
+        
+        # Check if this is a wellplate dataset using the same logic as HCS viewer
+        dataset_dir = self._get_dataset_directory_from_output_path(output_path)
+        logging.info(f"Extracted dataset directory: {dataset_dir}")
+        
+        is_wellplate = self._detect_wellplate_dataset(dataset_dir)
+        logging.info(f"Wellplate detection result: {is_wellplate}")
+        
+        if is_wellplate:
+            # This is a wellplate dataset - use HCS viewer
+            logging.info(f"Launching HCS viewer with dataset path: {dataset_dir}")
+            try:
+                self._launch_hcs_viewer(dataset_dir)
+            except Exception as e:
+                QMessageBox.critical(self, "Error Launching HCS Viewer", str(e))
+                logging.error(f"An error occurred while launching HCS viewer: {e}")
+                # Fall back to direct Napari opening
+                QMessageBox.information(self, "Fallback", "Falling back to direct Napari opening.")
+                self._open_in_napari(output_path)
+        else:
+            # Single file or single timepoint - open directly in Napari
+            logging.info(f"Opening in Napari with path: {output_path}")
+            self._open_in_napari(output_path)
+    
+    def _get_dataset_directory_from_output_path(self, output_path: str) -> pathlib.Path:
+        """Extract the dataset directory from the output path using the same logic as HCS viewer"""
+        output_dir = pathlib.Path(output_path)
+        logging.info(f"Processing output_path: {output_path}")
+        logging.info(f"Initial output_dir: {output_dir}")
+        logging.info(f"output_dir.name: {output_dir.name}")
+        logging.info(f"output_dir.is_dir(): {output_dir.is_dir()}")
+        
+        # The output_path points to a specific file/directory like:
+        # /path/to/output/2_stitched/RegionA_stitched.ome.zarr
+        # We need to go up to the parent directory that contains all timepoint dirs
+        if output_dir.name.endswith('.ome.zarr') or output_dir.name.endswith('.ome.tiff'):
+            # This is a zarr directory or tiff file, go up two levels: file -> timepoint_dir -> output_folder
+            output_dir = output_dir.parent.parent
+            logging.info(f"Path ends with .ome.zarr/.ome.tiff, going up 2 levels to: {output_dir}")
+        elif output_dir.is_dir() and output_dir.name.endswith("_stitched"):
+            # If we got a timepoint directory, go up one level to the output folder
+            output_dir = output_dir.parent
+            logging.info(f"Path is timepoint directory, going up 1 level to: {output_dir}")
+        else:
+            logging.info(f"No path adjustment needed, keeping: {output_dir}")
+        
+        logging.info(f"Final dataset directory: {output_dir}")
+        return output_dir
+    
+    def _detect_wellplate_dataset(self, directory: pathlib.Path) -> bool:
+        """Detect wellplate datasets using the same logic as HCS viewer"""
+        try:
+            import re
+            
+            # Check for timepoint directories with strict pattern: digit(s)_stitched
+            timepoint_dirs = []
+            for item in directory.iterdir():
+                if (item.is_dir() and 
+                    re.match(r'^\d+_stitched$', item.name)):  # Only match numeric timepoint dirs
+                    timepoint_dirs.append(item)
+            
+            logging.info(f"Checking dataset directory: {directory}")
+            logging.info(f"Found {len(timepoint_dirs)} timepoint directories: {[d.name for d in timepoint_dirs]}")
+            
+            if not timepoint_dirs:
+                logging.info("No timepoint directories found - not a wellplate dataset")
+                return False
+            
+            # Check for OME-ZARR files in timepoint directories and analyze region names
+            total_zarr_files = 0
+            wellplate_regions = set()
+            
+            for timepoint_dir in timepoint_dirs:
+                # Only look for .ome.zarr directories that match the stitcher output pattern
+                zarr_files = []
+                for item in timepoint_dir.iterdir():
+                    if (item.is_dir() and 
+                        item.name.endswith("_stitched.ome.zarr")):  # Strict stitcher output pattern
+                        zarr_files.append(item)
+                
+                total_zarr_files += len(zarr_files)
+                logging.info(f"Timepoint {timepoint_dir.name}: {len(zarr_files)} OME-ZARR files")
+                
+                # Extract region names and check for wellplate patterns (like A1, B2, etc.)
+                for zarr_dir in zarr_files:
+                    # Extract region name from directory name (same logic as HCS viewer)
+                    region_name = zarr_dir.stem.replace("_stitched.ome", "")
+                    
+                    # Skip system files that start with ._
+                    if region_name.startswith("._"):
+                        continue
+                    
+                    # Check if region name matches wellplate pattern (letter followed by number)
+                    # This is the key pattern the user mentioned: "one being a capitalized letter and the other a number"
+                    wellplate_match = re.match(r'^([A-Z]+)(\d+)$', region_name)
+                    if wellplate_match:
+                        wellplate_regions.add(region_name)
+                        logging.info(f"Found wellplate region: {region_name}")
+            
+            if total_zarr_files == 0:
+                logging.info("No OME-ZARR files found in timepoint directories - not a wellplate dataset")
+                return False
+            
+            # Determine if this is a wellplate dataset:
+            # 1. Multiple timepoints with any zarr files, OR
+            # 2. Single timepoint with multiple wellplate-pattern regions (A1, B2, etc.), OR  
+            # 3. Single timepoint with multiple zarr files (fallback for non-standard naming)
+            is_wellplate = (
+                len(timepoint_dirs) > 1 or  # Multiple timepoints
+                len(wellplate_regions) > 1 or  # Multiple wellplate regions
+                (len(timepoint_dirs) == 1 and total_zarr_files > 1)  # Single timepoint with multiple files
+            )
+            
+            if is_wellplate:
+                wellplate_type = "multiple timepoints" if len(timepoint_dirs) > 1 else f"wellplate regions ({len(wellplate_regions)} wells)" if wellplate_regions else "multiple regions"
+                logging.info(f"Wellplate dataset detected: {len(timepoint_dirs)} timepoints with {total_zarr_files} total files, type: {wellplate_type}")
+                QMessageBox.information(self, "Wellplate Dataset Detected", 
+                                      f"Detected {wellplate_type} with {total_zarr_files} total files. Launching HCS Grid Viewer for wellplate visualization.")
+            else:
+                logging.info(f"Single output detected: {len(timepoint_dirs)} timepoints with {total_zarr_files} total files")
+            
+            return is_wellplate
+            
+        except Exception as e:
+            logging.error(f"Error detecting wellplate dataset: {e}")
+            return False
+
+    def _launch_hcs_viewer(self, dataset_path: pathlib.Path) -> None:
+        """Launch the HCS viewer for wellplate datasets"""
+        try:
+            import subprocess
+            import sys
+            
+            # Find the HCS viewer script
+            hcs_viewer_path = pathlib.Path(__file__).parent.parent / "hcs_viewer" / "run_grid_viewer.py"
+            logging.info(f"HCS viewer script path: {hcs_viewer_path}")
+            logging.info(f"HCS viewer script exists: {hcs_viewer_path.exists()}")
+            logging.info(f"HCS viewer script is file: {hcs_viewer_path.is_file()}")
+            
+            if not hcs_viewer_path.exists():
+                raise FileNotFoundError(f"HCS viewer script not found at: {hcs_viewer_path}")
+            
+            # Test if we can read the script
+            try:
+                with open(hcs_viewer_path, 'r') as f:
+                    first_line = f.readline().strip()
+                    logging.info(f"HCS viewer script first line: {first_line}")
+            except Exception as e:
+                logging.error(f"Cannot read HCS viewer script: {e}")
+                raise
+            
+            # Verify dataset path exists
+            logging.info(f"Dataset path: {dataset_path}")
+            logging.info(f"Dataset path exists: {dataset_path.exists()}")
+            logging.info(f"Dataset path is dir: {dataset_path.is_dir()}")
+            
+            if not dataset_path.exists():
+                raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
+            
+            # Launch the HCS viewer as a separate process
+            cmd = [sys.executable, str(hcs_viewer_path), str(dataset_path)]
+            logging.info(f"Executing command: {' '.join(cmd)}")
+            
+            # Set environment variables to help PyQt6 find the platform plugins
+            env = os.environ.copy()
+            
+            # Try to find PyQt6 plugin path
+            try:
+                import PyQt6
+                pyqt6_path = pathlib.Path(PyQt6.__file__).parent
+                plugin_path = pyqt6_path / "Qt6" / "plugins"
+                if plugin_path.exists():
+                    env["QT_PLUGIN_PATH"] = str(plugin_path)
+                    logging.info(f"Set QT_PLUGIN_PATH to: {plugin_path}")
+                else:
+                    logging.warning(f"PyQt6 plugin path not found at: {plugin_path}")
+            except Exception as e:
+                logging.warning(f"Could not set QT_PLUGIN_PATH: {e}")
+            
+            # Set additional Qt environment variables
+            env["QT_QPA_PLATFORM"] = "cocoa"
+            env["QT_MAC_WANTS_LAYER"] = "1"
+            
+            # Use subprocess.run with capture_output to see any errors
+            process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            import time
+            time.sleep(2)
+
+            # Check if process is still running
+            if process.poll() is None:
+                logging.info(f"HCS viewer launched successfully (PID: {process.pid})")
+            else:
+                # Process exited, check for errors
+                stdout, stderr = process.communicate()
+                logging.error(f"HCS viewer failed to start. Return code: {process.returncode}")
+                logging.error(f"stdout: {stdout.decode()}")
+                logging.error(f"stderr: {stderr.decode()}")
+                raise Exception(f"HCS viewer failed to start: {stderr.decode()}")
+
+        except Exception as e:
+            logging.error(f"Failed to launch HCS viewer: {e}")
+            raise Exception(f"Failed to launch HCS viewer: {e}")
+    
+    def _open_in_napari(self, output_path: str) -> None:
+        """Open output directly in Napari (original functionality)"""
         try:
             viewer = napari.Viewer()
             if ".ome.zarr" in output_path:
