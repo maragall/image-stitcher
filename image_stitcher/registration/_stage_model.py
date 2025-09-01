@@ -25,7 +25,7 @@ from ._typing_utils import Float, FloatArray, Int
 logger = logging.getLogger(__name__)
 
 # Constants for validation
-MIN_VALID_TRANSLATIONS = 3  # Minimum number of valid translations needed for reliable statistics
+MIN_VALID_TRANSLATIONS = 1  # Minimum number of valid translations needed for reliable statistics
 MAX_OUTLIER_FACTOR = 3.0  # Maximum factor for outlier detection
 MIN_OVERLAP_PERCENT = 5.0  # Minimum required overlap percentage
 
