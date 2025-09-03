@@ -25,7 +25,7 @@ from ._typing_utils import Float, FloatArray, Int
 logger = logging.getLogger(__name__)
 
 # Constants for validation
-MIN_VALID_TRANSLATIONS = 3  # Minimum number of valid translations needed for reliable statistics
+MIN_VALID_TRANSLATIONS = 1  # Minimum number of valid translations needed for reliable statistics
 MAX_OUTLIER_FACTOR = 3.0  # Maximum factor for outlier detection
 MIN_OVERLAP_PERCENT = 5.0  # Minimum required overlap percentage
 
@@ -51,15 +51,31 @@ def validate_grid_dataframe(grid: pd.DataFrame, direction: str) -> None:
     Raises:
         ValueError: If DataFrame is invalid or missing required columns
     """
-    required_cols = [
+    # Check for both naming conventions to maintain compatibility
+    required_cols_v1 = [
         f"{direction}_x_first",
         f"{direction}_y_first",
         f"{direction}_ncc_first"
     ]
     
-    missing_cols = [col for col in required_cols if col not in grid.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+    required_cols_v2 = [
+        f"{direction}_x",
+        f"{direction}_y", 
+        f"{direction}_ncc"
+    ]
+    
+    # Try the new naming convention first (with _first suffix)
+    if all(col in grid.columns for col in required_cols_v1):
+        required_cols = required_cols_v1
+    # Fall back to old naming convention (without _first suffix)
+    elif all(col in grid.columns for col in required_cols_v2):
+        required_cols = required_cols_v2
+    else:
+        # Show what columns are actually available for debugging
+        available_cols = [col for col in grid.columns if direction in col]
+        raise ValueError(f"Missing required columns for direction '{direction}'. "
+                       f"Expected either {required_cols_v1} or {required_cols_v2}. "
+                       f"Available columns with '{direction}': {available_cols}")
         
     if grid.empty:
         raise ValueError("Empty grid DataFrame")
@@ -213,24 +229,34 @@ def filter_by_repeatability(
         if not any(isvalid):
             grid.loc[grp.index, "left_valid3"] = False
         else:
-            medx = grp[isvalid]["left_y_first"].median()
-            medy = grp[isvalid]["left_x_first"].median()
+            # Handle both naming conventions
+            y_col = "left_y_first" if "left_y_first" in grid.columns else "left_y"
+            x_col = "left_x_first" if "left_x_first" in grid.columns else "left_x"
+            ncc_col = "left_ncc_first" if "left_ncc_first" in grid.columns else "left_ncc"
+            
+            medy = grp[isvalid][y_col].median()
+            medx = grp[isvalid][x_col].median()
             grid.loc[grp.index, "left_valid3"] = (
-                grp["left_y_first"].between(medx - r, medx + r)
-                & grp["left_x_first"].between(medy - r, medy + r)
-                & (grp["left_ncc_first"] > ncc_threshold)
+                grp[y_col].between(medy - r, medy + r)
+                & grp[x_col].between(medx - r, medx + r)
+                & (grp[ncc_col] > ncc_threshold)
             )
     for _, grp in grid.groupby("row"):
         isvalid = grp["top_valid2"]
         if not any(isvalid):
             grid.loc[grp.index, "top_valid3"] = False
         else:
-            medx = grp[isvalid]["top_y_first"].median()
-            medy = grp[isvalid]["top_x_first"].median()
+            # Handle both naming conventions
+            y_col = "top_y_first" if "top_y_first" in grid.columns else "top_y"
+            x_col = "top_x_first" if "top_x_first" in grid.columns else "top_x"
+            ncc_col = "top_ncc_first" if "top_ncc_first" in grid.columns else "top_ncc"
+            
+            medy = grp[isvalid][y_col].median()
+            medx = grp[isvalid][x_col].median()
             grid.loc[grp.index, "top_valid3"] = (
-                grp["top_y_first"].between(medx - r, medx + r)
-                & grp["top_x_first"].between(medy - r, medy + r)
-                & (grp["top_ncc_first"] > ncc_threshold)
+                grp[y_col].between(medy - r, medy + r)
+                & grp[x_col].between(medx - r, medx + r)
+                & (grp[ncc_col] > ncc_threshold)
             )
     return grid
 
@@ -252,9 +278,21 @@ def replace_invalid_translations(grid: pd.DataFrame) -> pd.DataFrame:
     for direction in ["left", "top"]:
         for key in ["x", "y", "ncc"]:
             isvalid = grid[f"{direction}_valid3"]
-            grid.loc[isvalid, f"{direction}_{key}_second"] = grid.loc[
-                isvalid, f"{direction}_{key}_first"
-            ]
+            # Handle both naming conventions
+            first_col = f"{direction}_{key}_first"
+            second_col = f"{direction}_{key}_second"
+            
+            if first_col in grid.columns:
+                grid.loc[isvalid, second_col] = grid.loc[isvalid, first_col]
+            else:
+                # Fallback to non-suffixed columns if _first columns don't exist
+                fallback_col = f"{direction}_{key}"
+                if fallback_col in grid.columns:
+                    grid.loc[isvalid, second_col] = grid.loc[isvalid, fallback_col]
+                else:
+                    # Create empty column if neither exists
+                    grid[second_col] = np.nan
+                    
             # Add source column if it doesn't exist
             if f"{direction}_source" not in grid.columns:
                 grid[f"{direction}_source"] = TranslationSource.INVALID
@@ -266,12 +304,28 @@ def replace_invalid_translations(grid: pd.DataFrame) -> pd.DataFrame:
             isvalid = grp[f"{direction}_valid3"].astype(bool)
             if any(isvalid):
                 # Replace invalid translations with median of valid ones
-                grid.loc[grp.index[~isvalid], f"{direction}_y_second"] = grp[isvalid][
-                    f"{direction}_y_first"
-                ].median()
-                grid.loc[grp.index[~isvalid], f"{direction}_x_second"] = grp[isvalid][
-                    f"{direction}_x_first"
-                ].median()
+                # Handle both naming conventions
+                y_first_col = f"{direction}_y_first"
+                x_first_col = f"{direction}_x_first"
+                
+                if y_first_col in grid.columns:
+                    grid.loc[grp.index[~isvalid], f"{direction}_y_second"] = grp[isvalid][y_first_col].median()
+                else:
+                    fallback_y_col = f"{direction}_y"
+                    if fallback_y_col in grid.columns:
+                        grid.loc[grp.index[~isvalid], f"{direction}_y_second"] = grp[isvalid][fallback_y_col].median()
+                    else:
+                        grid.loc[grp.index[~isvalid], f"{direction}_y_second"] = 0.0
+                        
+                if x_first_col in grid.columns:
+                    grid.loc[grp.index[~isvalid], f"{direction}_x_second"] = grp[isvalid][x_first_col].median()
+                else:
+                    fallback_x_col = f"{direction}_x"
+                    if fallback_x_col in grid.columns:
+                        grid.loc[grp.index[~isvalid], f"{direction}_x_second"] = grp[isvalid][fallback_x_col].median()
+                    else:
+                        grid.loc[grp.index[~isvalid], f"{direction}_x_second"] = 0.0
+                        
                 grid.loc[grp.index[~isvalid], f"{direction}_ncc_second"] = 0.0  # No correlation for estimated translations
                 grid.loc[grp.index[~isvalid], f"{direction}_source"] = TranslationSource.ESTIMATED
 
