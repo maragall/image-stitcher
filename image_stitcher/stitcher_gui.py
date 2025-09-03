@@ -522,11 +522,7 @@ class StitchingGUI(QWidget):
         """Handle completion of stitching."""
         self.statusLabel.setText("Status: Stitching completed")
         self.progressBar.hide()
-        QMessageBox.information(
-            self,
-            "Stitching Complete",
-            "Image stitching has been completed successfully."
-        )
+        logging.info("Image stitching has been completed successfully.")
 
     def onFlatfieldModeChanged(self, idx: int) -> None:
         show_load_option = (idx == 2)
@@ -712,10 +708,9 @@ class StitchingGUI(QWidget):
             try:
                 self._launch_hcs_viewer(dataset_dir)
             except Exception as e:
-                QMessageBox.critical(self, "Error Launching HCS Viewer", str(e))
                 logging.error(f"An error occurred while launching HCS viewer: {e}")
                 # Fall back to direct Napari opening
-                QMessageBox.information(self, "Fallback", "Falling back to direct Napari opening.")
+                logging.info("Falling back to direct Napari opening.")
                 self._open_in_napari(output_path)
         else:
             # Single file or single timepoint - open directly in Napari
@@ -814,8 +809,7 @@ class StitchingGUI(QWidget):
             if is_wellplate:
                 wellplate_type = "multiple timepoints" if len(timepoint_dirs) > 1 else f"wellplate regions ({len(wellplate_regions)} wells)" if wellplate_regions else "multiple regions"
                 logging.info(f"Wellplate dataset detected: {len(timepoint_dirs)} timepoints with {total_zarr_files} total files, type: {wellplate_type}")
-                QMessageBox.information(self, "Wellplate Dataset Detected", 
-                                      f"Detected {wellplate_type} with {total_zarr_files} total files. Launching HCS Grid Viewer for wellplate visualization.")
+                logging.info(f"Launching HCS Grid Viewer for wellplate visualization.")
             else:
                 logging.info(f"Single output detected: {len(timepoint_dirs)} timepoints with {total_zarr_files} total files")
             
@@ -877,9 +871,17 @@ class StitchingGUI(QWidget):
             except Exception as e:
                 logging.warning(f"Could not set QT_PLUGIN_PATH: {e}")
             
-            # Set additional Qt environment variables
-            env["QT_QPA_PLATFORM"] = "cocoa"
-            env["QT_MAC_WANTS_LAYER"] = "1"
+            # Set additional Qt environment variables based on platform
+            import platform
+            system = platform.system().lower()
+            if system == "darwin":  # macOS
+                env["QT_QPA_PLATFORM"] = "cocoa"
+                env["QT_MAC_WANTS_LAYER"] = "1"
+            elif system == "linux":
+                env["QT_QPA_PLATFORM"] = "xcb"
+            elif system == "windows":
+                env["QT_QPA_PLATFORM"] = "windows"
+            # For other platforms, let Qt auto-detect
             
             # Use subprocess.run with capture_output to see any errors
             process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -899,17 +901,26 @@ class StitchingGUI(QWidget):
 
         except Exception as e:
             logging.error(f"Failed to launch HCS viewer: {e}")
-            raise Exception(f"Failed to launch HCS viewer: {e}")
+            logging.error("HCS viewer launch failed, raising exception to trigger fallback")
+            # Re-raise the exception so the caller can handle the fallback
+            raise
     
     def _open_in_napari(self, output_path: str) -> None:
         """Open output directly in Napari (original functionality)"""
         try:
-            viewer = napari.Viewer()
+            logging.info(f"Opening napari viewer for: {output_path}")
+            
+            # Create a new viewer instance each time
+            viewer = napari.Viewer(show=True)
+            
             if ".ome.zarr" in output_path:
+                logging.info("Loading as OME-ZARR file")
                 viewer.open(output_path, plugin="napari-ome-zarr")
             else:
+                logging.info("Loading as regular file")
                 viewer.open(output_path)
 
+            # Apply color and contrast settings
             for layer in viewer.layers:
                 wavelength = self.extractWavelength(layer.name)
                 channel_info = CHANNEL_COLORS_MAP.get(
@@ -929,10 +940,13 @@ class StitchingGUI(QWidget):
                 elif np.issubdtype(layer.data.dtype, np.floating):
                     layer.contrast_limits = (0.0, 1.0)
 
-            napari.run()
+            # Don't call napari.run() - let the viewer run independently
+            logging.info("Napari viewer opened successfully")
+            
         except Exception as e:
-            QMessageBox.critical(self, "Error Opening in Napari", str(e))
             logging.error(f"An error occurred while opening output in Napari: {e}")
+            import traceback
+            traceback.print_exc()
 
     def extractWavelength(self, name: str) -> str | None:
         # Split the string and find the wavelength number immediately after "Fluorescence"
@@ -996,11 +1010,7 @@ class StitchingGUI(QWidget):
         """Handle completion of registration."""
         self.statusLabel.setText("Status: Registration completed")
         self.progressBar.hide()
-        QMessageBox.information(
-            self,
-            "Registration Complete",
-            "Image registration has been completed successfully."
-        )
+        logging.info("Image registration has been completed successfully.")
 
 
 if __name__ == "__main__":
