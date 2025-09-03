@@ -71,9 +71,69 @@ logger = logging.getLogger(__name__)
 
 # Constants for file handling
 DEFAULT_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_(?P<z_level>\d+)_", re.I)
+# Additional regex for multi-page TIFF files with "_stack" suffix
+MULTIPAGE_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_stack", re.I)
 DEFAULT_FOV_COL = "fov"
 DEFAULT_X_COL = "x (mm)"
 DEFAULT_Y_COL = "y (mm)"
+
+# TODO: TECHNICAL DEBT - This is a poor design pattern that should be refactored
+# 
+# PROBLEM: This helper function creates duplicate regex logic and inconsistent interfaces.
+# Multiple functions now have two different code paths for filename parsing, making
+# the codebase harder to maintain and debug.
+#
+# BETTER PATTERN: Create a proper FileFormat abstraction with:
+#   1. FileFormat enum (REGULAR_TIFF, MULTIPAGE_TIFF)
+#   2. FileFormatDetector class to identify format from filename
+#   3. FileFormatHandler interface with format-specific parsing logic
+#   4. Update all filename parsing to use the abstraction consistently
+#
+# This would:
+#   - Centralize format detection logic
+#   - Make adding new formats easier
+#   - Eliminate duplicate regex patterns
+#   - Provide consistent interfaces across all functions
+#   - Enable proper unit testing of format-specific behavior
+#
+# For now, this helper function provides a quick fix for multi-page TIFF support
+# but should be replaced with the proper abstraction in a future refactor.
+
+def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]]]:
+    """TEMPORARY HELPER: Parse FOV info from filename, handling both regular and multi-page TIFF formats.
+    
+    WARNING: This function duplicates regex logic and should be replaced with a proper
+    FileFormat abstraction. See TODO comment above for the recommended approach.
+    
+    Parameters
+    ----------
+    filename : str
+        The filename to parse
+        
+    Returns
+    -------
+    Optional[Dict[str, Union[str, int]]]
+        Dictionary with 'region', 'fov', and optionally 'z_level' keys, or None if no match
+    """
+    # Try regular TIFF pattern first
+    m = DEFAULT_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov')),
+            'z_level': int(m.group('z_level'))
+        }
+    
+    # Try multi-page TIFF pattern
+    m = MULTIPAGE_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov')),
+            # No z_level for multi-page TIFFs - let GUI/parameters control z-selection
+        }
+    
+    return None
 
 # Constants for tile registration
 MIN_PITCH_FOR_FACTOR = 0.1  # Minimum pitch value to use factor-based tolerance (mm)
@@ -735,37 +795,49 @@ def extract_tile_indices(
     valid_indices_in_filenames = []
 
     for i, fname in enumerate(filenames):
-        m = fov_re.search(fname)
-        if not m:
-            logger.warning(f"{fname}: cannot extract FOV with pattern {fov_re.pattern}. Skipping this file.")
-            continue
-        try:
-            # Use named groups if available
-            if 'fov' in m.groupdict():
-                fov_str = m.group('fov')
-            else:
-                fov_str = m.group(1)
-            fov = int(fov_str)
-        except (IndexError, ValueError):
-            logger.warning(f"{fname}: FOV regex matched, but could not extract a valid integer FOV. Skipping.")
-            continue
+        # TECHNICAL DEBT: This dual-path parsing is a poor pattern - see TODO above parse_filename_fov_info()
+        # The function now has inconsistent behavior depending on filename format
+        # TODO: Replace with proper FileFormat abstraction
+        fov_info = parse_filename_fov_info(fname)
+        m = None  # Initialize m
+        if fov_info:
+            fov = fov_info['fov']
+        else:
+            # Fall back to provided regex pattern
+            m = fov_re.search(fname)
+            if not m:
+                logger.warning(f"{fname}: cannot extract FOV with pattern {fov_re.pattern}. Skipping this file.")
+                continue
+            try:
+                # Use named groups if available
+                if 'fov' in m.groupdict():
+                    fov_str = m.group('fov')
+                else:
+                    fov_str = m.group(1)
+                fov = int(fov_str)
+            except (IndexError, ValueError):
+                logger.warning(f"{fname}: FOV regex matched, but could not extract a valid integer FOV. Skipping.")
+                continue
 
         # For multi-region support, also check region match if present
-        region_match = True
-        if 'region' in m.groupdict() and 'region' in coords_df.columns:
+        file_region = None
+        if fov_info and 'region' in coords_df.columns:
+            file_region = fov_info['region']
+        elif m and 'region' in m.groupdict() and 'region' in coords_df.columns:
             file_region = m.group('region')
-            # Filter by region as well
-            df_row = coords_df.loc[
-                (coords_df[fov_col_name].astype(int) == fov) & 
-                (coords_df['region'] == file_region)
-            ]
-        else:
-            # Original behavior without region filtering
-            try:
+        
+        # Get coordinates for this FOV, filtering by region if available
+        try:
+            if file_region:
+                df_row = coords_df.loc[
+                    (coords_df[fov_col_name].astype(int) == fov) & 
+                    (coords_df['region'] == file_region)
+                ]
+            else:
                 df_row = coords_df.loc[coords_df[fov_col_name].astype(int) == fov]
-            except ValueError:
-                logger.error(f"Could not convert column '{fov_col_name}' to int for comparison.")
-                raise
+        except ValueError:
+            logger.error(f"Could not convert column '{fov_col_name}' to int for comparison.")
+            raise
 
         if df_row.empty:
             logger.warning(f"FOV {fov} (from {fname}) not in coordinates DataFrame. Skipping this file.")
@@ -774,16 +846,22 @@ def extract_tile_indices(
             logger.warning(f"FOV {fov} (from {fname}) has multiple entries. Using the first one that matches the z-level if possible.")
             
             # Try to find an entry that also matches the z-level from the filename
-            if 'z_level' in m.groupdict():
+            # For multi-page TIFFs, skip z-level refinement and let GUI/parameters control z-selection
+            z_level_fname = None
+            if fov_info and 'z_level' in fov_info:
+                z_level_fname = fov_info['z_level']
+            elif m and 'z_level' in m.groupdict():
                 try:
                     z_level_fname = int(m.group('z_level'))
-                    if 'z_level' in coords_df.columns:
-                        matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_fname]
-                        if not matching_z_rows.empty:
-                            df_row = matching_z_rows
-                            logger.info(f"Refined selection for FOV {fov} to include z_level {z_level_fname}.")
                 except ValueError:
                     logger.warning(f"Could not parse z_level from filename {fname}.")
+            
+            if z_level_fname is not None and 'z_level' in coords_df.columns:
+                matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_fname]
+                if not matching_z_rows.empty:
+                    df_row = matching_z_rows
+                    logger.info(f"Refined selection for FOV {fov} to include z_level {z_level_fname}.")
+            # For multi-page TIFFs (no z_level in filename), use first entry and let z-slice filtering handle selection
             
             if len(df_row) > 1:
                 logger.warning(f"Still multiple entries for FOV {fov}. Using the first.")
@@ -1161,10 +1239,9 @@ def read_tiff_images_for_region(
     # Filter for the specific region
     region_paths = []
     for path in all_tiff_paths:
-        m = fov_re.search(path.name)
-        if m and 'region' in m.groupdict():
-            if m.group('region') == region:
-                region_paths.append(path)
+        fov_info = parse_filename_fov_info(path.name)
+        if fov_info and fov_info['region'] == region:
+            region_paths.append(path)
     
     if not region_paths:
         print(f"No files found for region '{region}'")
@@ -1176,16 +1253,21 @@ def read_tiff_images_for_region(
         fov_to_files_map: Dict[int, List[Tuple[int, Path]]] = {}
         
         for path in region_paths:
-            m = fov_re.search(path.name)
-            if m:
+            fov_info = parse_filename_fov_info(path.name)
+            if fov_info:
                 try:
-                    fov = int(m.group('fov'))
-                    z_level = int(m.group('z_level'))
+                    fov = fov_info['fov']
+                    # For multi-page TIFFs, z_level is not in filename
+                    if 'z_level' in fov_info:
+                        z_level = fov_info['z_level']
+                    else:
+                        # Multi-page TIFF: use z_slice_to_keep as the target z-level
+                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
                     
                     if fov not in fov_to_files_map:
                         fov_to_files_map[fov] = []
                     fov_to_files_map[fov].append((z_level, path))
-                except (IndexError, ValueError):
+                except (KeyError, ValueError):
                     logger.warning(f"Could not parse FOV/Z from {path.name}")
         
         for fov, z_files in fov_to_files_map.items():
@@ -1237,6 +1319,9 @@ def read_tiff_images_for_region(
 def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
     """Load a single image with error handling.
     
+    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice
+    to match the default stitching behavior.
+    
     Parameters
     ----------
     path : Path
@@ -1248,7 +1333,23 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
         Tuple of (filename, image_array) or (filename, None) if loading failed
     """
     try:
-        return path.name, tifffile.imread(str(path))
+        # Check if this is a multi-page TIFF
+        if "_stack" in path.name:
+            # Multi-page TIFF: extract middle z-slice to match stitching behavior
+            with tifffile.TiffFile(path) as tif:
+                num_pages = len(tif.pages)
+                if num_pages > 1:
+                    # Use middle z-slice (same logic as stitcher's middle_layer strategy)
+                    middle_z = num_pages // 2
+                    image = tif.pages[middle_z].asarray()
+                    logger.debug(f"Loaded middle z-slice {middle_z} from {path.name} ({num_pages} total slices)")
+                    return path.name, image
+                else:
+                    # Single page, load normally
+                    return path.name, tif.pages[0].asarray()
+        else:
+            # Regular TIFF file
+            return path.name, tifffile.imread(str(path))
     except MemoryError:
         logger.error(f"MemoryError reading {path}. File might be too large or corrupt.")
         return path.name, None
@@ -1660,10 +1761,9 @@ def register_and_update_coordinates(
         # Filter for the specific region
         region_paths = []
         for path in selected_tiff_paths:
-            m = DEFAULT_FOV_RE.search(path.name)
-            if m and 'region' in m.groupdict():
-                if m.group('region') == region:
-                    region_paths.append(path)
+            fov_info = parse_filename_fov_info(path.name)
+            if fov_info and fov_info['region'] == region:
+                region_paths.append(path)
         
         if not region_paths:
             print(f"No images found for region {region}, skipping")
@@ -1674,16 +1774,22 @@ def register_and_update_coordinates(
             fov_to_files_map: Dict[int, List[Tuple[int, Path]]] = {}
             
             for path in region_paths:
-                m = DEFAULT_FOV_RE.search(path.name)
-                if m:
+                fov_info = parse_filename_fov_info(path.name)
+                if fov_info:
                     try:
-                        fov = int(m.group('fov'))
-                        z_level = int(m.group('z_level'))
+                        fov = fov_info['fov']
+                        # For multi-page TIFFs, z_level is not in filename - use the file as-is
+                        # The z-slice selection will happen during image loading
+                        if 'z_level' in fov_info:
+                            z_level = fov_info['z_level']
+                        else:
+                            # Multi-page TIFF: use z_slice_for_registration as the target z-level
+                            z_level = z_slice_for_registration
                         
                         if fov not in fov_to_files_map:
                             fov_to_files_map[fov] = []
                         fov_to_files_map[fov].append((z_level, path))
-                    except (IndexError, ValueError):
+                    except (KeyError, ValueError):
                         logger.warning(f"Could not parse FOV/Z from {path.name}")
             
             selected_tiff_paths = []
