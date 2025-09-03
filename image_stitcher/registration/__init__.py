@@ -20,7 +20,7 @@ __all__ = [
     'process_multiple_timepoints',
     'visualize_registration',
     'refine_translations',
-    'compute_final_position',Update
+    'compute_final_position',
     'DEFAULT_FOV_RE',
     'extract_tile_indices'
 ] 
