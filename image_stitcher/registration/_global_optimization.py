@@ -30,14 +30,29 @@ def validate_grid_dataframe(grid: pd.DataFrame) -> None:
     Raises:
         ValueError: If DataFrame is invalid or missing required columns
     """
-    required_cols = [
+    # Check for both naming conventions to maintain compatibility
+    required_cols_v1 = [
+        'left_x_first', 'left_y_first', 'left_ncc_first', 'left_valid3',
+        'top_x_first', 'top_y_first', 'top_ncc_first', 'top_valid3'
+    ]
+    
+    required_cols_v2 = [
         'left_x', 'left_y', 'left_ncc', 'left_valid3',
         'top_x', 'top_y', 'top_ncc', 'top_valid3'
     ]
     
-    missing_cols = [col for col in required_cols if col not in grid.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+    # Try the new naming convention first (with _first suffix)
+    if all(col in grid.columns for col in required_cols_v1):
+        required_cols = required_cols_v1
+    # Fall back to old naming convention (without _first suffix)
+    elif all(col in grid.columns for col in required_cols_v2):
+        required_cols = required_cols_v2
+    else:
+        # Show what columns are actually available for debugging
+        available_cols = [col for col in grid.columns if any(d in col for d in ['left', 'top'])]
+        raise ValueError(f"Missing required columns. "
+                       f"Expected either {required_cols_v1} or {required_cols_v2}. "
+                       f"Available columns: {available_cols}")
         
     if grid.empty:
         raise ValueError("Empty grid DataFrame")
@@ -67,8 +82,13 @@ def compute_maximum_spanning_tree(grid: pd.DataFrame) -> nx.Graph:
     for i, g in grid.iterrows():
         for direction in ["left", "top"]:
             if not pd.isna(g[direction]):
+                # Handle both naming conventions
+                ncc_col = f"{direction}_ncc_first" if f"{direction}_ncc_first" in grid.columns else f"{direction}_ncc"
+                y_col = f"{direction}_y_first" if f"{direction}_y_first" in grid.columns else f"{direction}_y"
+                x_col = f"{direction}_x_first" if f"{direction}_x_first" in grid.columns else f"{direction}_x"
+                
                 # Base weight is the correlation value
-                weight = g[f"{direction}_ncc"]
+                weight = g[ncc_col]
                 
                 # Add bonus for validated translations
                 if g[f"{direction}_valid3"]:
@@ -82,8 +102,8 @@ def compute_maximum_spanning_tree(grid: pd.DataFrame) -> nx.Graph:
                     direction=direction,
                     f=i,
                     t=g[direction],
-                    y=g[f"{direction}_y"],
-                    x=g[f"{direction}_x"],
+                    y=g[y_col],
+                    x=g[x_col],
                 )
     
     if not connection_graph.edges:
