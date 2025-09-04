@@ -15,6 +15,14 @@ dependencies:
   - napari-ome-zarr
   - napari[all]
   - pyqt
+  # Core dependencies for image processing
+  - tifffile
+  - tqdm
+  - networkx
+  - scikit-image
+  - matplotlib
+  # Testing dependencies
+  - pytest
   # NOTE: basicpy must be installed in your conda environment with pip.  Run the ./setup_ubuntu_22_04.sh script
   # to handle this, or with your conda environment activated run pip install basicpy.  There is no basicpy
   # package on conda-forge, and the installations instructions suggest pip:

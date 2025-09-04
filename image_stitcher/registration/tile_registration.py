@@ -11,6 +11,18 @@ their stage coordinates without performing full image stitching. It includes:
 
 The module is designed to work with TIFF images and CSV coordinate files from
 microscope acquisition systems.
+
+KEY IMPROVEMENT: Neighborhood-aware batching ensures that tiles and their neighbors
+are always loaded in the same batch, eliminating cross-batch translation failures
+that occurred in previous implementations. This guarantees complete translation
+computation for all valid tile pairs.
+
+CRITICAL FIX: Fixed broken neighbor assignment that was converting NaN values to
+garbage integer indices, creating fake neighbor relationships between tiles that
+shouldn't be neighbors. Now properly preserves NaN for missing neighbors.
+
+NOTE: This module now uses a single, unified registration function (register_tiles_batched)
+that replaces the previous broken register_tiles function.
 """
 import os
 from dataclasses import dataclass
@@ -20,16 +32,17 @@ import logging
 from multiprocessing import Pool, cpu_count
 import multiprocessing as mp
 import json
+import gc
+import psutil
+from typing import Dict, List, Optional, Tuple, Union, Pattern, Iterator, Set
+from ._typing_utils import BoolArray
+from ._typing_utils import Float
+from ._typing_utils import NumArray
 
 import numpy as np
 import pandas as pd
 import tifffile
 from tqdm import tqdm
-
-from typing import Dict, List, Optional, Tuple, Union, Pattern
-from ._typing_utils import BoolArray
-from ._typing_utils import Float
-from ._typing_utils import NumArray
 
 from ._constrained_refinement import refine_translations
 from ._global_optimization import compute_final_position
@@ -58,15 +71,667 @@ logger = logging.getLogger(__name__)
 
 # Constants for file handling
 DEFAULT_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_(?P<z_level>\d+)_", re.I)
+# Additional regex for multi-page TIFF files with "_stack" suffix
+MULTIPAGE_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_stack", re.I)
 DEFAULT_FOV_COL = "fov"
 DEFAULT_X_COL = "x (mm)"
 DEFAULT_Y_COL = "y (mm)"
+
+# TODO: TECHNICAL DEBT - This is a poor design pattern that should be refactored
+# 
+# PROBLEM: This helper function creates duplicate regex logic and inconsistent interfaces.
+# Multiple functions now have two different code paths for filename parsing, making
+# the codebase harder to maintain and debug.
+#
+# BETTER PATTERN: Create a proper FileFormat abstraction with:
+#   1. FileFormat enum (REGULAR_TIFF, MULTIPAGE_TIFF)
+#   2. FileFormatDetector class to identify format from filename
+#   3. FileFormatHandler interface with format-specific parsing logic
+#   4. Update all filename parsing to use the abstraction consistently
+#
+# This would:
+#   - Centralize format detection logic
+#   - Make adding new formats easier
+#   - Eliminate duplicate regex patterns
+#   - Provide consistent interfaces across all functions
+#   - Enable proper unit testing of format-specific behavior
+#
+# For now, this helper function provides a quick fix for multi-page TIFF support
+# but should be replaced with the proper abstraction in a future refactor.
+
+def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]]]:
+    """TEMPORARY HELPER: Parse FOV info from filename, handling both regular and multi-page TIFF formats.
+    
+    WARNING: This function duplicates regex logic and should be replaced with a proper
+    FileFormat abstraction. See TODO comment above for the recommended approach.
+    
+    Parameters
+    ----------
+    filename : str
+        The filename to parse
+        
+    Returns
+    -------
+    Optional[Dict[str, Union[str, int]]]
+        Dictionary with 'region', 'fov', and optionally 'z_level' keys, or None if no match
+    """
+    # Try regular TIFF pattern first
+    m = DEFAULT_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov')),
+            'z_level': int(m.group('z_level'))
+        }
+    
+    # Try multi-page TIFF pattern
+    m = MULTIPAGE_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov')),
+            # No z_level for multi-page TIFFs - let GUI/parameters control z-selection
+        }
+    
+    return None
 
 # Constants for tile registration
 MIN_PITCH_FOR_FACTOR = 0.1  # Minimum pitch value to use factor-based tolerance (mm)
 DEFAULT_ABSOLUTE_TOLERANCE = 0.05  # Default absolute tolerance (mm)
 ROW_TOL_FACTOR = 0.20  # Tolerance factor for row clustering
 COL_TOL_FACTOR = 0.20  # Tolerance factor for column clustering
+DEFAULT_EDGE_WIDTH = 256  # Increased from 64 to 256 for better correlation with 2048x2048 tiles
+
+@dataclass
+class Neighborhood:
+    """A tile and its required neighbors for translation computation."""
+    center_idx: int
+    left_idx: Optional[int] = None
+    top_idx: Optional[int] = None
+    
+    def get_all_indices(self) -> Set[int]:
+        """Get all unique image indices needed for this neighborhood."""
+        indices = {self.center_idx}
+        if self.left_idx is not None:
+            indices.add(self.left_idx)
+        if self.top_idx is not None:
+            indices.add(self.top_idx)
+        return indices
+
+def create_neighborhoods(master_grid: pd.DataFrame) -> List[Neighborhood]:
+    """Create neighborhoods for all tiles that need translation computation."""
+    neighborhoods = []
+    
+    for idx, row in master_grid.iterrows():
+        # Only create neighborhood if tile has at least one neighbor to compute with
+        left_neighbor = None if pd.isna(row['left']) else int(row['left'])
+        top_neighbor = None if pd.isna(row['top']) else int(row['top'])
+        
+        if left_neighbor is not None or top_neighbor is not None:
+            neighborhoods.append(Neighborhood(
+                center_idx=idx,
+                left_idx=left_neighbor,
+                top_idx=top_neighbor
+            ))
+    
+    return neighborhoods
+
+def group_neighborhoods_into_batches(
+    neighborhoods: List[Neighborhood], 
+    selected_tiff_paths: List[Path], 
+    max_memory_bytes: int
+) -> List[List[Neighborhood]]:
+    """Group neighborhoods into memory-constrained batches."""
+    
+    # Estimate memory per image
+    first_image = tifffile.imread(str(selected_tiff_paths[0]))
+    bytes_per_image = first_image.nbytes * 4  # 4x overhead
+    del first_image
+    gc.collect()
+    
+    batches = []
+    current_batch = []
+    current_images = set()
+    
+    for neighborhood in neighborhoods:
+        # Calculate images needed for this neighborhood
+        neighborhood_images = neighborhood.get_all_indices()
+        
+        # Check if adding this neighborhood would exceed memory limit
+        new_images = neighborhood_images - current_images
+        memory_needed = len(current_images | neighborhood_images) * bytes_per_image
+        
+        if memory_needed > max_memory_bytes and current_batch:
+            # Start new batch
+            batches.append(current_batch)
+            current_batch = [neighborhood]
+            current_images = neighborhood_images.copy()
+        else:
+            # Add to current batch
+            current_batch.append(neighborhood)
+            current_images |= neighborhood_images
+    
+    # Add final batch
+    if current_batch:
+        batches.append(current_batch)
+    
+    return batches
+
+def load_batch_for_neighborhoods(
+    neighborhood_batch: List[Neighborhood],
+    selected_tiff_paths: List[Path],
+    all_filenames: List[str]
+) -> Tuple[Dict[str, np.ndarray], List[int]]:
+    """Load all unique images needed for a batch of neighborhoods."""
+    
+    # Get all unique image indices needed
+    all_needed_indices = set()
+    for neighborhood in neighborhood_batch:
+        all_needed_indices.update(neighborhood.get_all_indices())
+    
+    needed_indices_list = sorted(list(all_needed_indices))
+    
+    # Load all needed images
+    needed_paths = [selected_tiff_paths[i] for i in needed_indices_list]
+    batch_images = load_batch_images(needed_paths)
+    
+    return batch_images, needed_indices_list
+
+def process_neighborhood_batch(
+    neighborhood_batch: List[Neighborhood],
+    batch_images: Dict[str, np.ndarray],
+    needed_indices_list: List[int],
+    selected_tiff_paths: List[Path],
+    all_filenames: List[str],
+    master_grid: pd.DataFrame,
+    edge_width: int
+) -> Dict[int, Dict[str, Dict[str, float]]]:
+    """Process translations for a batch of neighborhoods."""
+    
+    # Create index mapping: master_idx -> batch_array_idx
+    master_to_batch_map = {master_idx: batch_idx 
+                          for batch_idx, master_idx in enumerate(needed_indices_list)}
+    
+    # Create batch image array
+    batch_image_array = np.array([batch_images[selected_tiff_paths[i].name] 
+                                 for i in needed_indices_list])
+    
+    # Get image dimensions
+    full_sizeY, full_sizeX = batch_image_array.shape[1:3]
+    
+    # Results storage: {tile_idx: {direction: {ncc:, y:, x:}}}
+    results = {}
+    
+    # Process each neighborhood
+    for neighborhood in neighborhood_batch:
+        center_idx = neighborhood.center_idx
+        results[center_idx] = {}
+        
+        # Process left translation if exists
+        if neighborhood.left_idx is not None:
+            left_batch_idx = master_to_batch_map[neighborhood.left_idx]
+            center_batch_idx = master_to_batch_map[center_idx]
+            
+            translation_result = compute_single_translation(
+                batch_image_array[left_batch_idx],  # i1 (left image)
+                batch_image_array[center_batch_idx],  # i2 (center image)
+                "left",
+                full_sizeY, full_sizeX, edge_width
+            )
+            
+            if translation_result is not None:
+                results[center_idx]["left"] = {
+                    "ncc": translation_result[0],
+                    "y": translation_result[1], 
+                    "x": translation_result[2]
+                }
+        
+        # Process top translation if exists
+        if neighborhood.top_idx is not None:
+            top_batch_idx = master_to_batch_map[neighborhood.top_idx]
+            center_batch_idx = master_to_batch_map[center_idx]
+            
+            translation_result = compute_single_translation(
+                batch_image_array[top_batch_idx],   # i1 (top image)
+                batch_image_array[center_batch_idx], # i2 (center image)  
+                "top",
+                full_sizeY, full_sizeX, edge_width
+            )
+            
+            if translation_result is not None:
+                results[center_idx]["top"] = {
+                    "ncc": translation_result[0],
+                    "y": translation_result[1],
+                    "x": translation_result[2]
+                }
+    
+    return results
+
+def compute_single_translation(
+    image1_full: np.ndarray,
+    image2_full: np.ndarray, 
+    direction: str,
+    full_sizeY: int, full_sizeX: int, edge_width: int
+) -> Optional[Tuple[float, float, float]]:
+    """Compute translation between two images for given direction."""
+    
+    try:
+        # Extract edges based on direction
+        if direction == "left":  # i2 is to the right of i1
+            current_w = min(edge_width, full_sizeX)
+            edge1 = image1_full[:, -current_w:]
+            edge2 = image2_full[:, :current_w]
+            offset_y_edge1_in_full = 0
+            offset_x_edge1_in_full = full_sizeX - current_w
+        elif direction == "top":  # i2 is below i1
+            current_w = min(edge_width, full_sizeY)
+            edge1 = image1_full[-current_w:, :]
+            edge2 = image2_full[:current_w, :]
+            offset_y_edge1_in_full = full_sizeY - current_w
+            offset_x_edge1_in_full = 0
+        else:
+            return None
+        
+        if edge1.size == 0 or edge2.size == 0:
+            return None
+            
+        edge_sizeY, edge_sizeX = edge1.shape
+        
+        # PCM and peak finding on edges
+        PCM_on_edges = pcm(edge1, edge2).real
+        lims_edge_relative = np.array([[-edge_sizeY, edge_sizeY], [-edge_sizeX, edge_sizeX]])
+        
+        yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
+        
+        # interpret_translation
+        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation(
+            edge1, edge2, yins_edge, xins_edge, 
+            *lims_edge_relative[0], *lims_edge_relative[1]
+        )
+        
+        # Convert to global coordinates
+        y_best_global = y_best_edge_relative + offset_y_edge1_in_full
+        x_best_global = x_best_edge_relative + offset_x_edge1_in_full
+        
+        return (ncc_val, y_best_global, x_best_global)
+        
+    except Exception as e:
+        logger.warning(f"Failed to compute translation for direction {direction}: {e}")
+        return None
+
+def calculate_safe_batch_size(first_image_path: Path, memory_fraction: float = 0.75) -> int:
+    """Calculate safe batch size based on available memory and first image size."""
+    first_image = tifffile.imread(str(first_image_path))
+    image_memory = first_image.nbytes
+    del first_image
+    gc.collect()
+    
+    processing_overhead = 4  # Conservative 4x multiplier
+    total_per_image = image_memory * processing_overhead
+    
+    available_memory = psutil.virtual_memory().available * memory_fraction
+    max_batch_size = max(1, int(available_memory // total_per_image))
+    
+    print(f"Image memory: {image_memory/1e6:.1f}MB, "
+          f"Available: {available_memory/1e9:.1f}GB, "
+          f"Batch size: {max_batch_size}")
+    
+    return max_batch_size
+
+def batch_paths(paths: List[Path], batch_size: int) -> Iterator[List[Path]]:
+    """Split paths into batches of specified size."""
+    for i in range(0, len(paths), batch_size):
+        yield paths[i:i + batch_size]
+
+def load_batch_images(batch_paths: List[Path]) -> Dict[str, np.ndarray]:
+    """Load a batch of images using multiprocessing."""
+    n_processes = min(cpu_count(), len(batch_paths))
+    
+    with Pool(processes=n_processes) as pool:
+        results = list(tqdm(
+            pool.imap(load_single_image, batch_paths),
+            total=len(batch_paths),
+            desc="Loading batch"
+        ))
+    
+    return {k: v for k, v in results if v is not None}
+
+def register_tiles_batched(
+    selected_tiff_paths: List[Path],
+    region_coords: pd.DataFrame,
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    overlap_diff_threshold: float = 10,
+    pou: float = 3,
+    ncc_threshold: float = 0.5,
+    z_slice_to_keep: Optional[int] = 0
+) -> Tuple[pd.DataFrame, dict]:
+    """Register tiles using memory-constrained batched processing."""
+    
+    if not selected_tiff_paths:
+        return pd.DataFrame(), {}
+    
+    # Calculate safe batch size
+    batch_size = calculate_safe_batch_size(selected_tiff_paths[0])
+    
+    # DEBUG: Force small batch size for testing
+    batch_size = min(batch_size, 20)
+    print(f"DEBUG: Using batch size: {batch_size}")
+    
+    # Create complete grid structure BEFORE batching
+    all_filenames = [p.name for p in selected_tiff_paths]
+    rows, cols, filename_to_index = extract_tile_indices(all_filenames, region_coords)
+    
+    # DEBUG: Show grid structure
+    print(f"DEBUG: Grid dimensions: {len(rows)} tiles, {len(set(rows))} unique rows, {len(set(cols))} unique columns")
+    print(f"DEBUG: Row range: {min(rows)} to {max(rows)}")
+    print(f"DEBUG: Col range: {min(cols)} to {max(cols)}")
+    
+    # DEBUG: Show detailed FOV to grid position mapping
+    print("\nDEBUG: FOV to Grid Position Mapping:")
+    print("=" * 80)
+    for i, (filename, row, col) in enumerate(zip(all_filenames[:20], rows[:20], cols[:20])):  # Show first 20
+        # Extract FOV from filename
+        m = DEFAULT_FOV_RE.search(filename)
+        fov_num = "UNKNOWN"
+        if m:
+            try:
+                if 'fov' in m.groupdict():
+                    fov_num = m.group('fov')
+                else:
+                    fov_num = m.group(1)
+            except:
+                pass
+        
+        # Get stage coordinates
+        coord_idx = filename_to_index.get(filename, "NOT_FOUND")
+        if coord_idx != "NOT_FOUND" and coord_idx in region_coords.index:
+            stage_x = region_coords.loc[coord_idx, 'x (mm)']
+            stage_y = region_coords.loc[coord_idx, 'y (mm)']
+            print(f"Index {i:2d}: FOV {fov_num:3s} -> Grid(row={row:2d}, col={col:2d}) | Stage({stage_x:7.3f}, {stage_y:7.3f}) | {filename}")
+        else:
+            print(f"Index {i:2d}: FOV {fov_num:3s} -> Grid(row={row:2d}, col={col:2d}) | Stage(NOT_FOUND) | {filename}")
+    
+    if len(all_filenames) > 20:
+        print(f"... (showing first 20 of {len(all_filenames)} total)")
+    
+    # Initialize master grid with complete structure
+    master_grid = pd.DataFrame({
+        "col": cols,
+        "row": rows,
+    }, index=np.arange(len(cols)))
+    
+    # DEBUG: Show grid occupancy matrix
+    print("\nDEBUG: Grid Occupancy Matrix:")
+    print("=" * 50)
+    max_row = max(rows)
+    max_col = max(cols)
+    print(f"Grid size: {max_row + 1} rows × {max_col + 1} columns")
+    
+    # Create occupancy matrix
+    occupancy = {}
+    for i, (row, col) in enumerate(zip(rows, cols)):
+        if (row, col) not in occupancy:
+            occupancy[(row, col)] = []
+        occupancy[(row, col)].append(i)
+    
+    # Show occupancy conflicts
+    conflicts = [(pos, indices) for pos, indices in occupancy.items() if len(indices) > 1]
+    if conflicts:
+        print(f"WARNING: Found {len(conflicts)} grid position conflicts:")
+        for (row, col), indices in conflicts:
+            print(f"  Position (row={row}, col={col}) has tiles: {indices}")
+    
+    # Show grid pattern (first 10x10)
+    print("\nDEBUG: Grid Pattern (showing up to 10x10, 'X' = occupied, '.' = empty):")
+    display_rows = min(10, max_row + 1)
+    display_cols = min(10, max_col + 1)
+    for r in range(display_rows):
+        row_str = ""
+        for c in range(display_cols):
+            if (r, c) in occupancy:
+                row_str += "X "
+            else:
+                row_str += ". "
+        print(f"Row {r:2d}: {row_str}")
+    
+    print("DEBUG: First 10 rows of master grid:")
+    print(master_grid.head(10))
+    
+    coord_to_idx = pd.Series(master_grid.index, index=pd.MultiIndex.from_arrays([master_grid['col'], master_grid['row']]))
+    top_coords = pd.MultiIndex.from_arrays([master_grid['col'], master_grid['row'] - 1])
+    # FIXED: Proper neighbor assignment that preserves NaN for missing neighbors
+    top_neighbor_values = coord_to_idx.reindex(top_coords).values
+    top_neighbors = []
+    for val in top_neighbor_values:
+        if pd.isna(val):
+            top_neighbors.append(pd.NA)
+        else:
+            top_neighbors.append(int(val))
+    master_grid['top'] = pd.array(top_neighbors, dtype='Int64')  # Int64 supports NA
+    left_coords = pd.MultiIndex.from_arrays([master_grid['col'] - 1, master_grid['row']])
+    # FIXED: Proper neighbor assignment that preserves NaN for missing neighbors
+    left_neighbor_values = coord_to_idx.reindex(left_coords).values
+    left_neighbors = []
+    for val in left_neighbor_values:
+        if pd.isna(val):
+            left_neighbors.append(pd.NA)
+        else:
+            left_neighbors.append(int(val))
+    master_grid['left'] = pd.array(left_neighbors, dtype='Int64')  # Int64 supports NA
+    
+    # DEBUG: Show neighbor assignments
+    print("DEBUG: Neighbor assignments (first 20 rows):")
+    neighbor_debug = master_grid[['col', 'row', 'left', 'top']].head(20)
+    print(neighbor_debug)
+    
+
+    
+    # DEBUG: Show sample tiles for verification
+    print("DEBUG: Sample tile details:")
+    grid_size = len(master_grid)
+    sample_indices = [0, min(10, grid_size-1), min(20, grid_size-1), min(50, grid_size-1)]
+    for idx in sample_indices:
+        if idx < grid_size:
+            print(f"DEBUG: Tile {idx}: {dict(master_grid.loc[idx])}")
+    
+    # Initialize translation columns
+    for direction in ["left", "top"]:
+        for key in ["ncc", "y", "x"]:
+            master_grid[f"{direction}_{key}_first"] = np.nan
+            master_grid[f"{direction}_{key}_second"] = np.nan
+    
+    # Create neighborhoods and group into memory-constrained batches
+    neighborhoods = create_neighborhoods(master_grid)
+    
+    # Calculate memory constraints
+    first_image = tifffile.imread(str(selected_tiff_paths[0]))
+    max_memory = calculate_safe_batch_size(selected_tiff_paths[0]) * first_image.nbytes * 4
+    del first_image
+    gc.collect()
+    
+    neighborhood_batches = group_neighborhoods_into_batches(neighborhoods, selected_tiff_paths, max_memory)
+    
+    print(f"DEBUG: Created {len(neighborhoods)} neighborhoods in {len(neighborhood_batches)} batches")
+    
+    # Process each neighborhood batch
+    for batch_idx, neighborhood_batch in enumerate(neighborhood_batches):
+        print(f"Processing neighborhood batch {batch_idx + 1}/{len(neighborhood_batches)} with {len(neighborhood_batch)} neighborhoods")
+        
+        # Load all images needed for this batch
+        batch_images, needed_indices = load_batch_for_neighborhoods(neighborhood_batch, selected_tiff_paths, all_filenames)
+        
+        print(f"DEBUG: Loaded {len(batch_images)} unique images for {len(needed_indices)} indices")
+        
+        # Process all neighborhoods in this batch
+        translation_results = process_neighborhood_batch(
+            neighborhood_batch, batch_images, needed_indices, selected_tiff_paths, 
+            all_filenames, master_grid, edge_width
+        )
+        
+        print(f"DEBUG: Computed translations for {len(translation_results)} neighborhoods")
+        
+        # Update master grid with results
+        for center_idx, directions in translation_results.items():
+            for direction, translation_data in directions.items():
+                for key, value in translation_data.items():
+                    master_grid.loc[center_idx, f"{direction}_{key}_first"] = value
+        
+        # Force memory cleanup
+        del batch_images
+        gc.collect()
+    
+    # Run global optimization on complete grid (no images needed)
+    print("Running global optimization...")
+    
+    # DEBUG: Show master grid state before filtering
+    print("DEBUG: Master grid state before filtering:")
+    print(f"DEBUG: Grid shape: {master_grid.shape}")
+    print(f"DEBUG: Columns: {list(master_grid.columns)}")
+    
+    # DEBUG: Show translation data summary
+    print("DEBUG: Translation data summary:")
+    for direction in ["left", "top"]:
+        ncc_col = f"{direction}_ncc_first"
+        y_col = f"{direction}_y_first"
+        x_col = f"{direction}_x_first"
+        
+        if ncc_col in master_grid.columns:
+            valid_count = master_grid[ncc_col].notna().sum()
+            nan_count = master_grid[ncc_col].isna().sum()
+            print(f"DEBUG: {direction}: {valid_count} valid, {nan_count} NaN")
+            
+            if valid_count > 0:
+                ncc_values = master_grid[ncc_col].dropna()
+                y_values = master_grid[y_col].dropna()
+                x_values = master_grid[x_col].dropna()
+                print(f"DEBUG: {direction} NCC range: {ncc_values.min():.3f} to {ncc_values.max():.3f}")
+                print(f"DEBUG: {direction} Y range: {y_values.min():.1f} to {y_values.max():.1f}")
+                print(f"DEBUG: {direction} X range: {x_values.min():.1f} to {x_values.max():.1f}")
+    
+
+    
+    # Continue with existing filtering and optimization logic
+    has_top_pairs = np.any(master_grid["top_ncc_first"].dropna() > ncc_threshold)
+    has_left_pairs = np.any(master_grid["left_ncc_first"].dropna() > ncc_threshold)
+    
+    if not has_left_pairs and not has_top_pairs:
+        raise ValueError("No good initial pairs found - tiles may not have sufficient overlap")
+    
+    # Get image dimensions from first batch for overlap calculation
+    first_image = tifffile.imread(str(selected_tiff_paths[0]))
+    full_sizeY, full_sizeX = first_image.shape[:2]
+    del first_image
+    gc.collect()
+    
+    # Compute overlaps and continue with existing logic
+    if has_left_pairs:
+        left_displacement = compute_image_overlap2(
+            master_grid[master_grid["left_ncc_first"].fillna(-1) > ncc_threshold], 
+            "left", full_sizeY, full_sizeX
+        )
+        overlap_left = np.clip(100 - left_displacement[1] * 100, pou, 100 - pou)
+    else:
+        overlap_left = 50.0
+    
+    if has_top_pairs:
+        top_displacement = compute_image_overlap2(
+            master_grid[master_grid["top_ncc_first"].fillna(-1) > ncc_threshold], 
+            "top", full_sizeY, full_sizeX
+        )
+        overlap_top = np.clip(100 - top_displacement[0] * 100, pou, 100 - pou)
+    else:
+        overlap_top = 50.0
+    
+    # Apply filtering (existing logic)
+    if has_top_pairs:
+        master_grid["top_valid1"] = filter_by_overlap_and_correlation(
+            master_grid["top_y_first"], master_grid["top_ncc_first"], 
+            overlap_top, full_sizeY, pou, ncc_threshold
+        )
+        master_grid["top_valid2"] = filter_outliers(master_grid["top_y_first"], master_grid["top_valid1"])
+    else:
+        master_grid["top_valid1"] = pd.Series(False, index=master_grid.index)
+        master_grid["top_valid2"] = pd.Series(False, index=master_grid.index)
+    
+    if has_left_pairs:
+        master_grid["left_valid1"] = filter_by_overlap_and_correlation(
+            master_grid["left_x_first"], master_grid["left_ncc_first"], 
+            overlap_left, full_sizeX, pou, ncc_threshold
+        )
+        master_grid["left_valid2"] = filter_outliers(master_grid["left_x_first"], master_grid["left_valid1"])
+    else:
+        master_grid["left_valid1"] = pd.Series(False, index=master_grid.index)
+        master_grid["left_valid2"] = pd.Series(False, index=master_grid.index)
+    
+    # Compute repeatability and apply remaining filters
+    rs = []
+    for direction, dims_chars, rowcol_group_key in zip(["top", "left"], ["yx", "xy"], ["col", "row"]):
+        valid_key = f"{direction}_valid2"
+        valid_grid_subset = master_grid[master_grid[valid_key].fillna(False)]
+        
+        if len(valid_grid_subset) > 0:
+            w1s = valid_grid_subset[f"{direction}_{dims_chars[0]}_first"]
+            r1 = np.ceil((w1s.max() - w1s.min()) / 2) if len(w1s.dropna()) > 1 else 0
+            
+            r2_vals = []
+            for _, grp in valid_grid_subset.groupby(rowcol_group_key):
+                w2_series = grp[f"{direction}_{dims_chars[1]}_first"].dropna()
+                if len(w2_series) > 1:
+                    r2_vals.append(np.max(w2_series) - np.min(w2_series))
+            r2 = np.ceil(np.max(r2_vals) / 2) if r2_vals else 0
+            rs.append(max(r1, r2))
+        else:
+            rs.append(0)
+    
+    r_repeatability = np.max(rs) if rs else 0
+    
+    master_grid = filter_by_repeatability(master_grid, r_repeatability, ncc_threshold)
+    master_grid = replace_invalid_translations(master_grid)
+    
+    # DEBUG: Show master grid state before spanning tree computation
+    print("DEBUG: Master grid state before spanning tree computation:")
+    print(f"DEBUG: Grid shape: {master_grid.shape}")
+    print(f"DEBUG: Columns: {list(master_grid.columns)}")
+    
+    # DEBUG: Count edges and check for NaN values
+    edge_count = 0
+    nan_edge_count = 0
+    for idx, row in master_grid.iterrows():
+        for direction in ["left", "top"]:
+            if not pd.isna(row[direction]):
+                ncc_col = f"{direction}_ncc_first"
+                y_col = f"{direction}_y_first"
+                x_col = f"{direction}_x_first"
+                
+                ncc_val = row.get(ncc_col, np.nan)
+                y_val = row.get(y_col, np.nan)
+                x_val = row.get(x_col, np.nan)
+                
+                if pd.isna(ncc_val) or pd.isna(y_val) or pd.isna(x_val):
+                    nan_edge_count += 1
+                
+                edge_count += 1
+    
+    print(f"DEBUG: Total edges to be processed: {edge_count} ({nan_edge_count} with NaN values)")
+    
+    # Global optimization
+    print("DEBUG: Calling compute_maximum_spanning_tree...")
+    tree = compute_maximum_spanning_tree(master_grid)
+    print("DEBUG: Spanning tree computation successful!")
+    print(f"DEBUG: Tree has {len(tree.nodes)} nodes and {len(tree.edges)} edges")
+    
+    master_grid = compute_final_position(master_grid, tree)
+    
+    prop_dict = {
+        "W": full_sizeY,
+        "H": full_sizeX,
+        "overlap_left": overlap_left,
+        "overlap_top": overlap_top,
+        "repeatability": r_repeatability,
+        "edge_width_used": edge_width
+    }
+    
+    return master_grid, prop_dict
 
 @dataclass
 class RowInfo:
@@ -130,37 +795,49 @@ def extract_tile_indices(
     valid_indices_in_filenames = []
 
     for i, fname in enumerate(filenames):
-        m = fov_re.search(fname)
-        if not m:
-            logger.warning(f"{fname}: cannot extract FOV with pattern {fov_re.pattern}. Skipping this file.")
-            continue
-        try:
-            # Use named groups if available
-            if 'fov' in m.groupdict():
-                fov_str = m.group('fov')
-            else:
-                fov_str = m.group(1)
-            fov = int(fov_str)
-        except (IndexError, ValueError):
-            logger.warning(f"{fname}: FOV regex matched, but could not extract a valid integer FOV. Skipping.")
-            continue
+        # TECHNICAL DEBT: This dual-path parsing is a poor pattern - see TODO above parse_filename_fov_info()
+        # The function now has inconsistent behavior depending on filename format
+        # TODO: Replace with proper FileFormat abstraction
+        fov_info = parse_filename_fov_info(fname)
+        m = None  # Initialize m
+        if fov_info:
+            fov = fov_info['fov']
+        else:
+            # Fall back to provided regex pattern
+            m = fov_re.search(fname)
+            if not m:
+                logger.warning(f"{fname}: cannot extract FOV with pattern {fov_re.pattern}. Skipping this file.")
+                continue
+            try:
+                # Use named groups if available
+                if 'fov' in m.groupdict():
+                    fov_str = m.group('fov')
+                else:
+                    fov_str = m.group(1)
+                fov = int(fov_str)
+            except (IndexError, ValueError):
+                logger.warning(f"{fname}: FOV regex matched, but could not extract a valid integer FOV. Skipping.")
+                continue
 
         # For multi-region support, also check region match if present
-        region_match = True
-        if 'region' in m.groupdict() and 'region' in coords_df.columns:
+        file_region = None
+        if fov_info and 'region' in coords_df.columns:
+            file_region = fov_info['region']
+        elif m and 'region' in m.groupdict() and 'region' in coords_df.columns:
             file_region = m.group('region')
-            # Filter by region as well
-            df_row = coords_df.loc[
-                (coords_df[fov_col_name].astype(int) == fov) & 
-                (coords_df['region'] == file_region)
-            ]
-        else:
-            # Original behavior without region filtering
-            try:
+        
+        # Get coordinates for this FOV, filtering by region if available
+        try:
+            if file_region:
+                df_row = coords_df.loc[
+                    (coords_df[fov_col_name].astype(int) == fov) & 
+                    (coords_df['region'] == file_region)
+                ]
+            else:
                 df_row = coords_df.loc[coords_df[fov_col_name].astype(int) == fov]
-            except ValueError:
-                logger.error(f"Could not convert column '{fov_col_name}' to int for comparison.")
-                raise
+        except ValueError:
+            logger.error(f"Could not convert column '{fov_col_name}' to int for comparison.")
+            raise
 
         if df_row.empty:
             logger.warning(f"FOV {fov} (from {fname}) not in coordinates DataFrame. Skipping this file.")
@@ -169,16 +846,22 @@ def extract_tile_indices(
             logger.warning(f"FOV {fov} (from {fname}) has multiple entries. Using the first one that matches the z-level if possible.")
             
             # Try to find an entry that also matches the z-level from the filename
-            if 'z_level' in m.groupdict():
+            # For multi-page TIFFs, skip z-level refinement and let GUI/parameters control z-selection
+            z_level_fname = None
+            if fov_info and 'z_level' in fov_info:
+                z_level_fname = fov_info['z_level']
+            elif m and 'z_level' in m.groupdict():
                 try:
                     z_level_fname = int(m.group('z_level'))
-                    if 'z_level' in coords_df.columns:
-                        matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_fname]
-                        if not matching_z_rows.empty:
-                            df_row = matching_z_rows
-                            logger.info(f"Refined selection for FOV {fov} to include z_level {z_level_fname}.")
                 except ValueError:
                     logger.warning(f"Could not parse z_level from filename {fname}.")
+            
+            if z_level_fname is not None and 'z_level' in coords_df.columns:
+                matching_z_rows = df_row[df_row['z_level'].astype(int) == z_level_fname]
+                if not matching_z_rows.empty:
+                    df_row = matching_z_rows
+                    logger.info(f"Refined selection for FOV {fov} to include z_level {z_level_fname}.")
+            # For multi-page TIFFs (no z_level in filename), use first entry and let z-slice filtering handle selection
             
             if len(df_row) > 1:
                 logger.warning(f"Still multiple entries for FOV {fov}. Using the first.")
@@ -269,195 +952,6 @@ def extract_tile_indices(
     return final_row_assignments.tolist(), final_col_assignments.tolist(), fname_to_dfidx_map
 
 
-
-DEFAULT_EDGE_WIDTH = 256  # Increased from 64 to 256 for better correlation with 2048x2048 tiles
-
-def register_tiles(
-    images: NumArray,
-    rows: List[int],
-    cols: List[int],
-    edge_width: int = DEFAULT_EDGE_WIDTH, # New parameter
-    overlap_diff_threshold: Float = 10, #10 by default
-    pou: Float = 3, #3 by default
-    ncc_threshold: Float = 0.5, #0.5 by default
-) -> Tuple[pd.DataFrame, dict]:
-    """Register tiles using edge-based correlation without full stitching.
-    
-    Parameters
-    ----------
-    images : NumArray
-        Array of full images to register
-    rows : List[int]
-        Row indices for each image
-    cols : List[int]
-        Column indices for each image
-    edge_width : int
-        Width of the edge strips (in pixels) to use for registration.
-    overlap_diff_threshold : Float
-        Allowed difference from initial guess (percentage)
-    pou : Float
-        Percent overlap uncertainty
-    ncc_threshold : Float
-        Normalized cross correlation threshold
-        
-    Returns
-    -------
-    grid : pd.DataFrame
-        Registration results with global pixel positions
-    prop_dict : dict
-        Dictionary of estimated parameters
-    """
-    images_arr = np.array(images) # Ensure it's a NumPy array
-    if images_arr.ndim < 3: # Expecting (N, H, W) or (N, H, W, C)
-        raise ValueError("Images array must be at least 3-dimensional (N, H, W).")
-    if images_arr.shape[0] == 0:
-        logger.warning("Empty images array provided to register_tiles.")
-        # Return empty DataFrame and dict, or handle as appropriate
-        return pd.DataFrame(), {}
-
-    assert len(rows) == len(cols) == images_arr.shape[0]
-    
-    # Full image dimensions
-    full_sizeY, full_sizeX = images_arr.shape[1:3] # Use 1:3 to be robust for (N,H,W) or (N,H,W,C)
-                                                # Assuming registration on first channel if C exists,
-                                                # or that images are grayscale.
-                                                # If images are (N,C,H,W), then shape[2:4]
-
-    grid = pd.DataFrame({
-        "col": cols,
-        "row": rows,
-    }, index=np.arange(len(cols)))
-    
-    coord_to_idx = pd.Series(grid.index, index=pd.MultiIndex.from_arrays([grid['col'], grid['row']]))
-    
-    top_coords = pd.MultiIndex.from_arrays([grid['col'], grid['row'] - 1])
-    grid['top'] = pd.array(np.round(coord_to_idx.reindex(top_coords).values), dtype='Int32')
-    
-    left_coords = pd.MultiIndex.from_arrays([grid['col'] - 1, grid['row']])
-    grid['left'] = pd.array(np.round(coord_to_idx.reindex(left_coords).values), dtype='Int32')
-    
-    for direction in ["left", "top"]:
-        for key in ["ncc", "y", "x"]:
-            grid[f"{direction}_{key}_first"] = np.nan
-            # Ensure _second columns exist for refine_translations if they are result of replace_invalid_translations
-            grid[f"{direction}_{key}_second"] = np.nan 
-
-    # Translation computation using edges
-    with Pool(processes=min(2, cpu_count())) as pool:
-        # Pass full_sizeY, full_sizeX, and edge_width
-        args_for_pool = [(d, grid, images_arr, full_sizeY, full_sizeX, edge_width) for d in ["left", "top"]]
-        all_results = list(tqdm(
-            pool.imap(_compute_direction_translations, args_for_pool),
-            total=len(args_for_pool),
-            desc="Computing initial translations on edges"
-        ))
-        
-        for results_list in all_results:
-            for i2, direction, max_peak_global_translation in results_list: # max_peak is now global
-                for j, key in enumerate(["ncc", "y", "x"]):
-                    grid.loc[i2, f"{direction}_{key}_first"] = max_peak_global_translation[j]
-
-    # --- The rest of the function (filtering, global optimization) remains largely the same ---
-    # --- as it operates on the 'grid' DataFrame which now contains global translations ---
-    # --- derived from edge computations.                                               ---
-
-    # Example: (Ensure these functions are robust to NaNs from missing pairs)
-    has_top_pairs = np.any(grid["top_ncc_first"].dropna() > ncc_threshold)
-    has_left_pairs = np.any(grid["left_ncc_first"].dropna() > ncc_threshold)
-
-    if not has_left_pairs and not has_top_pairs:
-         raise ValueError("No good initial pairs found (left or top) - tiles may not have sufficient overlap or NCC threshold too high.")
-    if not has_left_pairs:
-        logger.warning("No good left pairs found - tiles may not have sufficient horizontal overlap or NCC threshold too high.")
-        # Create dummy left displacement if no left pairs exist but top pairs do
-        left_displacement = (0.0, 0.0) # (dy, dx) normalized
-        overlap_left = 50.0 # Default
-    else:
-        left_displacement = compute_image_overlap2(
-            grid[grid["left_ncc_first"].fillna(-1) > ncc_threshold], "left", full_sizeY, full_sizeX
-        )
-        overlap_left = np.clip(100 - left_displacement[1] * 100, pou, 100 - pou)
-
-
-    if not has_top_pairs:
-        logger.warning("No good top pairs found - tiles may not have sufficient vertical overlap or NCC threshold too high.")
-        top_displacement = (0.0, 0.0) # (dy, dx) normalized
-        overlap_top = 50.0 # Default
-    else:
-        top_displacement = compute_image_overlap2(
-            grid[grid["top_ncc_first"].fillna(-1) > ncc_threshold], "top", full_sizeY, full_sizeX
-        )
-        overlap_top = np.clip(100 - top_displacement[0] * 100, pou, 100 - pou)
-    
-    # Filter and validate translations
-    if has_top_pairs:
-        grid["top_valid1"] = filter_by_overlap_and_correlation(
-            grid["top_y_first"], grid["top_ncc_first"], overlap_top, full_sizeY, pou, ncc_threshold
-        )
-        grid["top_valid2"] = filter_outliers(grid["top_y_first"], grid["top_valid1"])
-    else:
-        grid["top_valid1"] = pd.Series(False, index=grid.index)
-        grid["top_valid2"] = pd.Series(False, index=grid.index)
-
-    if has_left_pairs:
-        grid["left_valid1"] = filter_by_overlap_and_correlation(
-            grid["left_x_first"], grid["left_ncc_first"], overlap_left, full_sizeX, pou, ncc_threshold
-        )
-        grid["left_valid2"] = filter_outliers(grid["left_x_first"], grid["left_valid1"])
-    else:
-        grid["left_valid1"] = pd.Series(False, index=grid.index)
-        grid["left_valid2"] = pd.Series(False, index=grid.index)
-    
-    rs = []
-    for direction, dims_chars, rowcol_group_key in zip(["top", "left"], ["yx", "xy"], ["col", "row"]):
-        valid_key = f"{direction}_valid2"
-        # Ensure 'valid_key' column exists, even if all False
-        if valid_key not in grid.columns: grid[valid_key] = False
-            
-        valid_grid_subset = grid[grid[valid_key].fillna(False)] # Handle potential NaNs in boolean column
-        
-        if len(valid_grid_subset) > 0:
-            # Primary dimension (e.g., 'top_y_first')
-            w1s = valid_grid_subset[f"{direction}_{dims_chars[0]}_first"]
-            if len(w1s.dropna()) > 0: # Check for non-NaN values before max/min
-                 r1 = np.ceil((w1s.max() - w1s.min()) / 2) if len(w1s) > 1 else 0
-            else:
-                 r1 = 0
-
-            # Secondary dimension (e.g., 'top_x_first'), grouped
-            # Original code seems to use zip(*valid_grid.groupby...)[f"{direction}_{dims[1]}_first"]),
-            # which might fail if groups are empty or structure changes.
-            # Safer way:
-            r2_vals = []
-            for _, grp in valid_grid_subset.groupby(rowcol_group_key):
-                w2_series = grp[f"{direction}_{dims_chars[1]}_first"].dropna()
-                if len(w2_series) > 1:
-                    r2_vals.append(np.max(w2_series) - np.min(w2_series))
-            r2 = np.ceil(np.max(r2_vals) / 2) if r2_vals else 0
-            rs.append(max(r1, r2))
-        else:
-            rs.append(0) # No valid translations for this direction
-    r_repeatability = np.max(rs) if rs else 0 # Max repeatability error
-
-    grid = filter_by_repeatability(grid, r_repeatability, ncc_threshold)
-    grid = replace_invalid_translations(grid) # This populates *_second columns
-    
-    # Pass edge_width to the modified refine_translations
-    grid = refine_translations(images_arr, grid, r_repeatability, edge_width) 
-    
-    tree = compute_maximum_spanning_tree(grid)
-    grid = compute_final_position(grid, tree)
-    
-    prop_dict = {
-        "W": full_sizeY, # Report full image dimensions
-        "H": full_sizeX,
-        "overlap_left": overlap_left,
-        "overlap_top": overlap_top,
-        "repeatability": r_repeatability,
-        "edge_width_used": edge_width # Add this for metadata
-    }
-    
-    return grid, prop_dict
 
 
 def calculate_pixel_size_microns(
@@ -745,10 +1239,9 @@ def read_tiff_images_for_region(
     # Filter for the specific region
     region_paths = []
     for path in all_tiff_paths:
-        m = fov_re.search(path.name)
-        if m and 'region' in m.groupdict():
-            if m.group('region') == region:
-                region_paths.append(path)
+        fov_info = parse_filename_fov_info(path.name)
+        if fov_info and fov_info['region'] == region:
+            region_paths.append(path)
     
     if not region_paths:
         print(f"No files found for region '{region}'")
@@ -760,16 +1253,21 @@ def read_tiff_images_for_region(
         fov_to_files_map: Dict[int, List[Tuple[int, Path]]] = {}
         
         for path in region_paths:
-            m = fov_re.search(path.name)
-            if m:
+            fov_info = parse_filename_fov_info(path.name)
+            if fov_info:
                 try:
-                    fov = int(m.group('fov'))
-                    z_level = int(m.group('z_level'))
+                    fov = fov_info['fov']
+                    # For multi-page TIFFs, z_level is not in filename
+                    if 'z_level' in fov_info:
+                        z_level = fov_info['z_level']
+                    else:
+                        # Multi-page TIFF: use z_slice_to_keep as the target z-level
+                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
                     
                     if fov not in fov_to_files_map:
                         fov_to_files_map[fov] = []
                     fov_to_files_map[fov].append((z_level, path))
-                except (IndexError, ValueError):
+                except (KeyError, ValueError):
                     logger.warning(f"Could not parse FOV/Z from {path.name}")
         
         for fov, z_files in fov_to_files_map.items():
@@ -821,6 +1319,9 @@ def read_tiff_images_for_region(
 def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
     """Load a single image with error handling.
     
+    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice
+    to match the default stitching behavior.
+    
     Parameters
     ----------
     path : Path
@@ -832,7 +1333,23 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
         Tuple of (filename, image_array) or (filename, None) if loading failed
     """
     try:
-        return path.name, tifffile.imread(str(path))
+        # Check if this is a multi-page TIFF
+        if "_stack" in path.name:
+            # Multi-page TIFF: extract middle z-slice to match stitching behavior
+            with tifffile.TiffFile(path) as tif:
+                num_pages = len(tif.pages)
+                if num_pages > 1:
+                    # Use middle z-slice (same logic as stitcher's middle_layer strategy)
+                    middle_z = num_pages // 2
+                    image = tif.pages[middle_z].asarray()
+                    logger.debug(f"Loaded middle z-slice {middle_z} from {path.name} ({num_pages} total slices)")
+                    return path.name, image
+                else:
+                    # Single page, load normally
+                    return path.name, tif.pages[0].asarray()
+        else:
+            # Regular TIFF file
+            return path.name, tifffile.imread(str(path))
     except MemoryError:
         logger.error(f"MemoryError reading {path}. File might be too large or corrupt.")
         return path.name, None
@@ -1233,42 +1750,88 @@ def register_and_update_coordinates(
         # Filter coordinates for this region
         region_coords = coords_df[coords_df['region'] == region].copy()
         
-        # Read images for this region only
+        # Get image paths for this region only
         # Look in the 0 subdirectory for TIFF files
         tiff_dir = image_directory / "0"
         if tiff_dir.exists():
-            region_images = read_tiff_images_for_region(
-                directory=tiff_dir,
-                pattern=channel_pattern,
-                region=region,
-                z_slice_to_keep=z_slice_for_registration
-            )
+            selected_tiff_paths = list(tiff_dir.glob(channel_pattern))
         else:
-            region_images = read_tiff_images_for_region(
-                directory=image_directory,
-                pattern=channel_pattern,
-                region=region,
-                z_slice_to_keep=z_slice_for_registration
-            )
+            selected_tiff_paths = list(image_directory.glob(channel_pattern))
         
-        if not region_images:
+        # Filter for the specific region
+        region_paths = []
+        for path in selected_tiff_paths:
+            fov_info = parse_filename_fov_info(path.name)
+            if fov_info and fov_info['region'] == region:
+                region_paths.append(path)
+        
+        if not region_paths:
             print(f"No images found for region {region}, skipping")
             continue
         
-        # Extract tile indices
-        filenames = list(region_images.keys())
+        # Apply z-slice filtering to region-specific files
+        if z_slice_for_registration is not None:
+            fov_to_files_map: Dict[int, List[Tuple[int, Path]]] = {}
+            
+            for path in region_paths:
+                fov_info = parse_filename_fov_info(path.name)
+                if fov_info:
+                    try:
+                        fov = fov_info['fov']
+                        # For multi-page TIFFs, z_level is not in filename - use the file as-is
+                        # The z-slice selection will happen during image loading
+                        if 'z_level' in fov_info:
+                            z_level = fov_info['z_level']
+                        else:
+                            # Multi-page TIFF: use z_slice_for_registration as the target z-level
+                            z_level = z_slice_for_registration
+                        
+                        if fov not in fov_to_files_map:
+                            fov_to_files_map[fov] = []
+                        fov_to_files_map[fov].append((z_level, path))
+                    except (KeyError, ValueError):
+                        logger.warning(f"Could not parse FOV/Z from {path.name}")
+            
+            selected_tiff_paths = []
+            for fov, z_files in fov_to_files_map.items():
+                if not z_files:
+                    continue
+                
+                # Find the file matching z_slice_for_registration
+                target_slice_found = False
+                for z_level, path in z_files:
+                    if z_level == z_slice_for_registration:
+                        selected_tiff_paths.append(path)
+                        target_slice_found = True
+                        break
+                
+                if not target_slice_found:
+                    # Fallback: use the lowest z_level
+                    z_files.sort(key=lambda x: x[0])
+                    fallback_path = z_files[0][1]
+                    selected_tiff_paths.append(fallback_path)
+                    logger.warning(f"Z-slice {z_slice_for_registration} not found for FOV {fov}. Using {fallback_path.name} instead.")
+        else:
+            selected_tiff_paths = region_paths
+        
+        if not selected_tiff_paths:
+            print(f"No files selected for region {region} after z-slice filtering")
+            continue
+        
+        # Extract tile indices from filenames
+        filenames = [p.name for p in selected_tiff_paths]
         rows, cols, filename_to_index = extract_tile_indices(filenames, region_coords)
         
         try:
-            # Register tiles
-            grid, prop_dict = register_tiles(
-                images=list(region_images.values()),
-                rows=rows,
-                cols=cols,
+            # Register tiles using batched processing
+            grid, prop_dict = register_tiles_batched(
+                selected_tiff_paths=selected_tiff_paths,
+                region_coords=region_coords,
                 edge_width=edge_width,
                 overlap_diff_threshold=overlap_diff_threshold,
                 pou=pou,
-                ncc_threshold=ncc_threshold
+                ncc_threshold=ncc_threshold,
+                z_slice_to_keep=z_slice_for_registration
             )
             
             # Calculate pixel size

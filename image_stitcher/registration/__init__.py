@@ -5,7 +5,7 @@ without performing full stitching.
 """
 
 from .tile_registration import (
-    register_tiles,
+    register_tiles_batched,
     register_and_update_coordinates,
     process_multiple_timepoints,
     DEFAULT_FOV_RE,
@@ -15,7 +15,7 @@ from ._constrained_refinement import refine_translations
 from ._global_optimization import compute_final_position
 
 __all__ = [
-    'register_tiles',
+    'register_tiles_batched',
     'register_and_update_coordinates',
     'process_multiple_timepoints',
     'visualize_registration',
