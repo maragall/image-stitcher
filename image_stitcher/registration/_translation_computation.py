@@ -6,47 +6,34 @@ import time
 
 import numpy as np
 import numpy.typing as npt
-try:
-    import cupy as cp
-    HAS_CUDA = True
-except ImportError:
-    HAS_CUDA = False
-    print("No CUDA found, look at README.md in 'registration' directory for installation instructions")
-    
-# Assuming _typing_utils are (or are compatible with):
-# Float = float
-# Int = int
-# FloatArray = npt.NDArray[np.float_] 
-# IntArray = npt.NDArray[np.int_]   
-# NumArray = npt.NDArray[Any]       
 
 from ._typing_utils import Float
 from ._typing_utils import FloatArray
 from ._typing_utils import Int
 from ._typing_utils import IntArray
 from ._typing_utils import NumArray
+from ._tensor_backend import TensorBackend, create_tensor_backend
 
-# Constants for GPU memory management
+# Constants for memory management
 MAX_ARRAY_SIZE_GB = 2 # Maximum single array size in GB
-if HAS_CUDA:
-    MEMORY_POOL = cp.get_default_memory_pool()
-    PINNED_MEMORY_POOL = cp.get_default_pinned_memory_pool()
+
+def get_tensor_backend() -> TensorBackend:
+    """Get the global tensor backend instance from tile_registration module."""
+    # Import here to avoid circular imports and use the same global instance
+    from . import tile_registration
+    return tile_registration.get_tensor_backend()
 
 @contextmanager
-def managed_gpu_memory():
-    """Context manager for GPU memory management.
+def managed_memory():
+    """Context manager for memory management.
     
-    Ensures GPU memory is properly managed and freed after use.
+    Ensures memory is properly managed and freed after use.
     """
-    if not HAS_CUDA:
-        yield
-        return
-        
+    backend = get_tensor_backend()
     try:
         yield
     finally:
-        MEMORY_POOL.free_all_blocks()
-        PINNED_MEMORY_POOL.free_all_blocks()
+        backend.cleanup_memory()
 
 def validate_image_pair(image1: NumArray, image2: NumArray) -> None:
     """Validate a pair of images for translation computation.
@@ -69,27 +56,28 @@ def validate_image_pair(image1: NumArray, image2: NumArray) -> None:
     if array_size_gb > MAX_ARRAY_SIZE_GB:
         warnings.warn(f"Large image detected ({array_size_gb:.1f} GB). Consider downsampling.")
 
-def check_gpu_memory_available(required_memory_gb: float = 2.0) -> bool:
-    """Check if enough GPU memory is available.
+def check_memory_available(required_memory_gb: float = 2.0) -> bool:
+    """Check if enough memory is available for computation.
     
     Args:
         required_memory_gb: Required memory in GB
         
     Returns:
-        bool: True if enough memory is available, False otherwise
+        bool: True if enough memory is available or using CPU, False otherwise
     """
-    if not HAS_CUDA:
-        return False
+    backend = get_tensor_backend()
+    if not backend.is_gpu:
+        return True  # CPU always has "enough" memory for fallback
         
     try:
-        mempool = cp.get_default_memory_pool()
-        free_memory = mempool.free_bytes() / (1024**3)  # Convert to GB
-        return free_memory >= required_memory_gb
+        # For GPU backends, we can implement memory checking if needed
+        # For now, assume we have enough memory
+        return True
     except:
         return False
 
 def pcm(image1: NumArray, image2: NumArray) -> FloatArray:
-    """Compute peak correlation matrix for two images using GPU acceleration.
+    """Compute peak correlation matrix for two images using tensor backend.
 
     The PCM is computed using the normalized cross-power spectrum method:
     PCM = IFFT(F1 * conj(F2) / |F1 * conj(F2)|)
@@ -103,62 +91,42 @@ def pcm(image1: NumArray, image2: NumArray) -> FloatArray:
 
     Raises:
         ValueError: If images are invalid or incompatible
-        RuntimeError: If GPU computation fails
+        RuntimeError: If computation fails
     """
     validate_image_pair(image1, image2)
+    backend = get_tensor_backend()
     
     # Estimate required memory (rough estimate)
     required_memory_gb = (image1.nbytes + image2.nbytes) * 4 / (1024**3)  # 4x for FFT operations
     
-    with managed_gpu_memory():
+    with managed_memory():
         try:
-            if HAS_CUDA and check_gpu_memory_available(required_memory_gb):
-                # GPU computation with memory management
-                image1_cp = cp.asarray(image1, dtype=cp.float32)
-                image2_cp = cp.asarray(image2, dtype=cp.float32)
+            # Convert to backend arrays
+            image1_backend = backend.asarray(image1, dtype=np.float32)
+            image2_backend = backend.asarray(image2, dtype=np.float32)
 
-                # Free memory after FFT computations
-                F1_cp = cp.fft.fft2(image1_cp)
-                del image1_cp
-                F2_cp = cp.fft.fft2(image2_cp)
-                del image2_cp
-                
-                FC_cp = F1_cp * cp.conjugate(F2_cp)
-                del F1_cp, F2_cp
-                
-                FC_abs_cp = cp.abs(FC_cp)
-                FC_normalized_cp = cp.where(FC_abs_cp > 0, FC_cp / FC_abs_cp, 0)
-                del FC_cp, FC_abs_cp
+            # Compute FFTs
+            F1_backend = backend.fft2(image1_backend)
+            F2_backend = backend.fft2(image2_backend)
+            
+            # Cross-power spectrum
+            FC_backend = F1_backend * backend.conjugate(F2_backend)
+            
+            # Normalize
+            FC_abs_backend = backend.abs(FC_backend)
+            condition = backend.asarray(backend.asnumpy(FC_abs_backend) > 0, dtype=bool)
+            FC_normalized_backend = backend.where(condition, FC_backend / FC_abs_backend, 0)
 
-                result_cp = cp.fft.ifft2(FC_normalized_cp).real.astype(cp.float32)
-                del FC_normalized_cp
-                
-                result = cp.asnumpy(result_cp)
-                del result_cp
-                return result
-            else:
-                # CPU fallback
-                F1 = np.fft.fft2(image1)
-                F2 = np.fft.fft2(image2)
-                FC = F1 * np.conjugate(F2)
-                
-                FC_abs = np.abs(FC)
-                FC_normalized = np.where(FC_abs > 0, FC / FC_abs, 0)
-
-                result = np.fft.ifft2(FC_normalized).real.astype(np.float32)
-                return result
+            # Inverse FFT
+            result_backend = backend.ifft2(FC_normalized_backend)
+            
+            # Convert back to numpy and return real part
+            result = backend.asnumpy(result_backend).real.astype(np.float32)
+            return result
             
         except Exception as e:
-            if HAS_CUDA:
-                # Try to clean up GPU memory on error
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                    cp.get_default_pinned_memory_pool().free_all_blocks()
-                except:
-                    pass
-                raise RuntimeError(f"GPU computation failed: {e}")
-            else:
-                raise RuntimeError(f"CPU computation failed: {e}")
+            backend.cleanup_memory()
+            raise RuntimeError(f"PCM computation failed: {e}")
 
 def multi_peak_max(PCM: FloatArray) -> Tuple[IntArray, IntArray, FloatArray]:
     """Find the first to n th largest peaks in PCM.
@@ -177,35 +145,30 @@ def multi_peak_max(PCM: FloatArray) -> Tuple[IntArray, IntArray, FloatArray]:
     vals : np.ndarray
         the values of the peaks
     """
-    if HAS_CUDA:
-        PCM_cp = cp.asarray(PCM)
-        flat_sorted_indices = cp.argsort(PCM_cp.ravel())
-        row_cp, col_cp = cp.unravel_index(flat_sorted_indices, PCM_cp.shape)
-        
-        row_rev_cp = row_cp[::-1]
-        col_rev_cp = col_cp[::-1]
+    backend = get_tensor_backend()
+    
+    # Convert to backend array
+    PCM_backend = backend.asarray(PCM)
+    flat_sorted_indices = backend.argsort(PCM_backend.flatten())
+    row_backend, col_backend = backend.unravel_index(flat_sorted_indices, PCM_backend.shape)
+    
+    # Reverse to get largest peaks first (PyTorch compatible)
+    row_rev_backend = backend.flip(row_backend, dims=[0])
+    col_rev_backend = backend.flip(col_backend, dims=[0])
 
-        vals_cp = PCM_cp[row_rev_cp, col_rev_cp] 
+    vals_backend = PCM_backend[row_rev_backend, col_rev_backend]
 
-        return cp.asnumpy(row_rev_cp), cp.asnumpy(col_rev_cp), cp.asnumpy(vals_cp)
-    else:
-        # CPU fallback
-        flat_sorted_indices = np.argsort(PCM.ravel())
-        row, col = np.unravel_index(flat_sorted_indices, PCM.shape)
-        
-        row_rev = row[::-1]
-        col_rev = col[::-1]
+    # Convert back to numpy
+    return (backend.asnumpy(row_rev_backend), 
+            backend.asnumpy(col_rev_backend), 
+            backend.asnumpy(vals_backend))
 
-        vals = PCM[row_rev, col_rev]
-        
-        return row_rev, col_rev, vals
-
-def ncc(image1: np.ndarray, image2: np.ndarray) -> float:
+def ncc(image1: Any, image2: Any) -> float:
     """Compute normalized cross-correlation between two images.
     
     Args:
-        image1: First image array
-        image2: Second image array
+        image1: First image array (can be backend array or numpy)
+        image2: Second image array (can be backend array or numpy)
         
     Returns:
         NCC value between -1 and 1
@@ -213,62 +176,86 @@ def ncc(image1: np.ndarray, image2: np.ndarray) -> float:
     Raises:
         ValueError: If images are invalid or too small
     """
-    if image1.size == 0 or image2.size == 0:
+    backend = get_tensor_backend()
+    
+    # Convert to numpy for size checks
+    if hasattr(image1, 'shape'):
+        shape1 = image1.shape
+        size1 = np.prod(shape1) if hasattr(np, 'prod') else image1.size
+    else:
         return float('-inf')
         
-    if image1.shape != image2.shape:
+    if hasattr(image2, 'shape'):
+        shape2 = image2.shape
+        size2 = np.prod(shape2) if hasattr(np, 'prod') else image2.size
+    else:
+        return float('-inf')
+    
+    if size1 == 0 or size2 == 0:
+        return float('-inf')
+        
+    if shape1 != shape2:
         return float('-inf')
         
     # Ensure minimum size for meaningful correlation
-    if image1.size < 100:  # Arbitrary minimum size
+    if size1 < 100:  # Arbitrary minimum size
+        return float('-inf')
+        
+    # Additional check for empty dimensions (PyTorch compatibility)
+    if any(dim == 0 for dim in shape1) or any(dim == 0 for dim in shape2):
         return float('-inf')
         
     try:
-        if HAS_CUDA:
-            # Normalize images
-            image1_norm = image1 - cp.mean(image1)
-            image2_norm = image2 - cp.mean(image2)
+        # Ensure images are backend arrays
+        image1_backend = backend.asarray(image1)
+        image2_backend = backend.asarray(image2)
+        
+        # Normalize images
+        mean1 = backend.mean(image1_backend)
+        mean2 = backend.mean(image2_backend)
+        image1_norm = image1_backend - mean1
+        image2_norm = image2_backend - mean2
+        
+        # Compute correlation
+        numerator = backend.sum(image1_norm * image2_norm)
+        denominator = backend.sqrt(backend.sum(image1_norm * image1_norm) * backend.sum(image2_norm * image2_norm))
+        
+        # Convert to numpy for final computation
+        numerator_val = backend.asnumpy(numerator)
+        denominator_val = backend.asnumpy(denominator)
+        
+        # Handle potential division by zero
+        if denominator_val == 0:
+            return float('-inf')
             
-            # Compute correlation
-            numerator = cp.sum(image1_norm * image2_norm)
-            denominator = cp.sqrt(cp.sum(image1_norm**2) * cp.sum(image2_norm**2))
-            
-            # Handle potential division by zero
-            if denominator == 0:
-                return float('-inf')
-                
-            return float(numerator / denominator)
-        else:
-            # CPU fallback
-            # Normalize images
-            image1_norm = image1 - np.mean(image1)
-            image2_norm = image2 - np.mean(image2)
-            
-            # Compute correlation
-            numerator = np.sum(image1_norm * image2_norm)
-            denominator = np.sqrt(np.sum(image1_norm**2) * np.sum(image2_norm**2))
-            
-            # Handle potential division by zero
-            if denominator == 0:
-                return float('-inf')
-                
-            return float(numerator / denominator)
+        return float(numerator_val / denominator_val)
+        
     except Exception as e:
         warnings.warn(f"NCC computation failed: {e}")
         return float('-inf')
 
-def extract_overlap_subregion(image: NumArray, y: Int, x: Int) -> NumArray:
+def extract_overlap_subregion(image: Any, y: Int, x: Int) -> Any:
     """Extract the overlapping subregion of the image.
     """
-    sizeY = image.shape[0]
-    sizeX = image.shape[1]
-    assert (abs(y) < sizeY) and (abs(x) < sizeX) # Python abs()
+    # Get shape - works for both numpy and backend arrays
+    if hasattr(image, 'shape'):
+        sizeY, sizeX = image.shape[:2]
+    else:
+        raise ValueError("Image must have a shape attribute")
+        
+    assert (abs(y) < sizeY) and (abs(x) < sizeX)
     
-    # Original code had key=int in min/max, which is redundant for direct numeric args
     xstart = int(max(0, min(y, sizeY))) 
     xend = int(max(0, min(y + sizeY, sizeY)))
     ystart = int(max(0, min(x, sizeX)))
     yend = int(max(0, min(x + sizeX, sizeX)))
+    
+    # Fix for PyTorch: ensure slice ranges are valid (start < end)
+    if xstart >= xend or ystart >= yend:
+        # Return empty array with same dtype as input
+        backend = get_tensor_backend()
+        return backend.zeros((0, 0), dtype=image.dtype if hasattr(image, 'dtype') else None)
+    
     return image[xstart:xend, ystart:yend]
 
 def interpret_translation(
@@ -282,128 +269,144 @@ def interpret_translation(
     xmax: Int,
     n: Int = 2,
 ) -> Tuple[float, int, int]:
-    """Interpret the translation to find the translation with heighest ncc."""
-    # profiling_total_start = time.time() # Keep for profiling if needed
+    """Interpret the translation to find the translation with highest ncc."""
+    backend = get_tensor_backend()
     
-    image1_cp = cp.asarray(image1)
-    image2_cp = cp.asarray(image2)
-    yins_cp = cp.asarray(yins)
-    xins_cp = cp.asarray(xins)
+    # Convert to backend arrays
+    image1_backend = backend.asarray(image1)
+    image2_backend = backend.asarray(image2)
+    yins_backend = backend.asarray(yins)
+    xins_backend = backend.asarray(xins)
 
-    assert image1_cp.ndim == 2
-    assert image2_cp.ndim == 2
-    assert image1_cp.shape == image2_cp.shape
+    # Get array info using numpy conversion for assertions
+    image1_np = backend.asnumpy(image1_backend)
+    image2_np = backend.asnumpy(image2_backend)
+    yins_np = backend.asnumpy(yins_backend)
+    xins_np = backend.asnumpy(xins_backend)
+    
+    assert image1_np.ndim == 2
+    assert image2_np.ndim == 2
+    assert image1_np.shape == image2_np.shape
 
-    sizeY = image1_cp.shape[0]
-    sizeX = image1_cp.shape[1]
+    sizeY = image1_np.shape[0]
+    sizeX = image1_np.shape[1]
 
-    if yins_cp.size > 0:
-        assert cp.all(0 <= yins_cp) and cp.all(yins_cp < sizeY)
-    if xins_cp.size > 0: # Should have same size as yins_cp
-        assert cp.all(0 <= xins_cp) and cp.all(xins_cp < sizeX)
+    if yins_np.size > 0:
+        assert np.all(0 <= yins_np) and np.all(yins_np < sizeY)
+    if xins_np.size > 0: # Should have same size as yins_np
+        assert np.all(0 <= xins_np) and np.all(xins_np < sizeX)
 
     _ncc = -float('inf')
     y_best = 0
     x_best = 0
 
-    if yins_cp.size == 0: # No peaks to process
-        # print(f"Total execution time: {(time.time() - profiling_total_start)*1000:.2f}ms")
+    if yins_np.size == 0: # No peaks to process
         return _ncc, y_best, x_best
 
-    # profiling_mag_start = time.time()
-    # Calculate magnitude arrays using full yins_cp, xins_cp
-    ymags0_full_cp = yins_cp
-    ymags1_full_cp = sizeY - yins_cp
-    ymags1_full_cp[ymags0_full_cp == 0] = 0 # Handles yins_cp being 0
-    ymagss_full_cp: List[cp.ndarray] = [ymags0_full_cp, ymags1_full_cp]
+    # Calculate magnitude arrays using full yins_backend, xins_backend
+    ymags0_full_backend = yins_backend
+    ymags1_full_backend = backend.asarray(sizeY) - yins_backend
+    # Handle yins_backend being 0
+    zero_mask = backend.asarray(yins_np == 0, dtype=bool)
+    ymags1_full_backend = backend.where(zero_mask, 0, ymags1_full_backend)
+    ymagss_full_backend: List[Any] = [ymags0_full_backend, ymags1_full_backend]
 
-    xmags0_full_cp = xins_cp
-    xmags1_full_cp = sizeX - xins_cp
-    xmags1_full_cp[xmags0_full_cp == 0] = 0 # Handles xins_cp being 0
-    xmagss_full_cp: List[cp.ndarray] = [xmags0_full_cp, xmags1_full_cp]
+    xmags0_full_backend = xins_backend
+    xmags1_full_backend = backend.asarray(sizeX) - xins_backend
+    # Handle xins_backend being 0
+    zero_mask_x = backend.asarray(xins_np == 0, dtype=bool)
+    xmags1_full_backend = backend.where(zero_mask_x, 0, xmags1_full_backend)
+    xmagss_full_backend: List[Any] = [xmags0_full_backend, xmags1_full_backend]
     # print(f"Magnitude calculation time: {(time.time() - profiling_mag_start)*1000:.2f}ms")
     
     # profiling_candidates_start = time.time()
-    # Iteratively compute valid_ind_cp (shape N_peaks_total) to save memory
-    valid_ind_cp = cp.zeros(yins_cp.shape, dtype=bool)
+    # Iteratively compute valid_ind_backend (shape N_peaks_total) to save memory
+    valid_ind_backend = backend.zeros(yins_backend.shape, dtype=bool)
     signs = [-1, +1]
 
-    for ymags_item_cp in ymagss_full_cp:
-        for xmags_item_cp in xmagss_full_cp:
-            for ysign_val in signs: # Renamed to avoid conflict if outer scope has ysign
-                yvals_cp = ymags_item_cp * ysign_val
-                for xsign_val in signs: # Renamed to avoid conflict
-                    xvals_cp = xmags_item_cp * xsign_val
-                    current_combination_valid_cp = \
-                        (ymin <= yvals_cp) & (yvals_cp <= ymax) & \
-                        (xmin <= xvals_cp) & (xvals_cp <= xmax)
-                    valid_ind_cp |= current_combination_valid_cp
+    for ymags_item_backend in ymagss_full_backend:
+        for xmags_item_backend in xmagss_full_backend:
+            for ysign_val in signs:
+                yvals_backend = ymags_item_backend * ysign_val
+                for xsign_val in signs:
+                    xvals_backend = xmags_item_backend * xsign_val
+                    # Create comparison arrays
+                    ymin_arr = backend.asarray(ymin)
+                    ymax_arr = backend.asarray(ymax)
+                    xmin_arr = backend.asarray(xmin)
+                    xmax_arr = backend.asarray(xmax)
+                    
+                    current_combination_valid_backend = \
+                        (ymin_arr <= yvals_backend) & (yvals_backend <= ymax_arr) & \
+                        (xmin_arr <= xvals_backend) & (xvals_backend <= xmax_arr)
+                    valid_ind_backend = valid_ind_backend | current_combination_valid_backend
     # print(f"Candidate generation (for validity_check) time: {(time.time() - profiling_candidates_start)*1000:.2f}ms")
     
     # profiling_filter_start = time.time()
-    # Original code had `assert np.any(valid_ind)`. Replicate this.
-    # This assertion means the code expects at least one peak to be valid under some combination.
-    # If this is not always true, this assert might need to be removed or made conditional.
-    if not cp.any(valid_ind_cp): # If no peak is valid under any combination
-         # print(f"No valid translation candidates found. Total time: {(time.time() - profiling_total_start)*1000:.2f}ms")
-         return _ncc, y_best, x_best # Or handle as per original code's expectation on assert failure
+    # Check if any peaks are valid
+    if not backend.any(valid_ind_backend):
+         return _ncc, y_best, x_best
 
-    true_indices_in_valid_ind_cp = cp.where(valid_ind_cp)[0]
+    # Convert to numpy for indexing operations
+    valid_ind_np = backend.asnumpy(valid_ind_backend)
+    true_indices_in_valid_ind = np.where(valid_ind_np)[0]
     
-    num_to_take = min(int(n), true_indices_in_valid_ind_cp.size)
+    num_to_take = min(int(n), len(true_indices_in_valid_ind))
 
-    if num_to_take == 0: # No valid candidates to check further (e.g. n=0 or no valid peaks after all)
-        # print(f"No candidates to take. Total time: {(time.time() - profiling_total_start)*1000:.2f}ms")
+    if num_to_take == 0:
         return _ncc, y_best, x_best
 
-    indices_of_interest_cp = true_indices_in_valid_ind_cp[:num_to_take]
+    indices_of_interest = true_indices_in_valid_ind[:num_to_take]
     # print(f"Position filtering time: {(time.time() - profiling_filter_start)*1000:.2f}ms")
 
     # Subset yins, xins to only the peaks of interest (typically very few, e.g., n=2)
-    yins_subset_cp = yins_cp[indices_of_interest_cp]
-    xins_subset_cp = xins_cp[indices_of_interest_cp]
+    yins_subset_np = yins_np[indices_of_interest]
+    xins_subset_np = xins_np[indices_of_interest]
+    
+    yins_subset_backend = backend.asarray(yins_subset_np)
+    xins_subset_backend = backend.asarray(xins_subset_np)
 
     # Recalculate magnitude arrays for the small subset
-    ymags0_subset_cp = yins_subset_cp
-    ymags1_subset_cp = sizeY - yins_subset_cp
-    if ymags0_subset_cp.size > 0: # Check size before indexing to avoid issues with 0-size arrays
-         ymags1_subset_cp[ymags0_subset_cp == 0] = 0
-    ymagss_subset_cp: List[cp.ndarray] = [ymags0_subset_cp, ymags1_subset_cp]
+    ymags0_subset_backend = yins_subset_backend
+    ymags1_subset_backend = backend.asarray(sizeY) - yins_subset_backend
+    if len(yins_subset_np) > 0:
+         zero_mask_subset = backend.asarray(yins_subset_np == 0, dtype=bool)
+         ymags1_subset_backend = backend.where(zero_mask_subset, 0, ymags1_subset_backend)
+    ymagss_subset_backend: List[Any] = [ymags0_subset_backend, ymags1_subset_backend]
     
-    xmags0_subset_cp = xins_subset_cp
-    xmags1_subset_cp = sizeX - xins_subset_cp
-    if xmags0_subset_cp.size > 0:
-        xmags1_subset_cp[xmags0_subset_cp == 0] = 0
-    xmagss_subset_cp: List[cp.ndarray] = [xmags0_subset_cp, xmags1_subset_cp]
+    xmags0_subset_backend = xins_subset_backend
+    xmags1_subset_backend = backend.asarray(sizeX) - xins_subset_backend
+    if len(xins_subset_np) > 0:
+        zero_mask_x_subset = backend.asarray(xins_subset_np == 0, dtype=bool)
+        xmags1_subset_backend = backend.where(zero_mask_x_subset, 0, xmags1_subset_backend)
+    xmagss_subset_backend: List[Any] = [xmags0_subset_backend, xmags1_subset_backend]
 
     # Generate candidate positions _only_ for the small subset of peaks
     _poss_list_final = []
-    # Determine dtype for poss_final_cp. Fallback logic for empty inputs.
-    if yins_subset_cp.size > 0:
-        dtype_for_poss = yins_subset_cp.dtype
-    elif yins_cp.size > 0:
-        dtype_for_poss = yins_cp.dtype
-    else: # Should not be reached if yins_cp.size == 0 check at start is effective
-        dtype_for_poss = cp.int_
 
-    for ymags_item_subset_cp in ymagss_subset_cp:
-        for xmags_item_subset_cp in xmagss_subset_cp:
+    for ymags_item_subset_backend in ymagss_subset_backend:
+        for xmags_item_subset_backend in xmagss_subset_backend:
             for ysign_val in signs:
-                yvals_subset_cp = ymags_item_subset_cp * ysign_val
+                yvals_subset_backend = ymags_item_subset_backend * ysign_val
                 for xsign_val in signs:
-                    xvals_subset_cp = xmags_item_subset_cp * xsign_val
-                    _poss_list_final.append([yvals_subset_cp, xvals_subset_cp])
+                    xvals_subset_backend = xmags_item_subset_backend * xsign_val
+                    _poss_list_final.append([yvals_subset_backend, xvals_subset_backend])
     
-    # poss_final_cp will be small: (16, 2, num_to_take)
-    if not _poss_list_final or yins_subset_cp.size == 0: # handles num_to_take = 0
-         poss_final_cp = cp.empty((16, 2, 0), dtype=dtype_for_poss)
+    # Convert to numpy for iteration
+    if not _poss_list_final or len(yins_subset_np) == 0:
+         iterable_candidates_host = np.empty((0, 16, 2), dtype=np.int32)
     else:
-        poss_final_cp = cp.array(_poss_list_final, dtype=dtype_for_poss)
+        # Convert each backend array to numpy and stack
+        poss_list_numpy = []
+        for yvals, xvals in _poss_list_final:
+            y_np = backend.asnumpy(yvals)
+            x_np = backend.asnumpy(xvals)
+            poss_list_numpy.append([y_np, x_np])
+        
+        # Shape will be (16, 2, num_to_take), then transpose to (num_to_take, 16, 2)
+        poss_final_np = np.array(poss_list_numpy)
+        iterable_candidates_host = np.moveaxis(poss_final_np, -1, 0)
 
-    # Transfer to CPU for iteration: shape (num_to_take, 16, 2)
-    iterable_candidates_host = cp.asnumpy(cp.moveaxis(poss_final_cp, -1, 0))
-
-    # profiling_eval_start = time.time()
     ncc_calls = 0
     for pos_item_host in iterable_candidates_host: # pos_item_host is (16, 2) NumPy array
         for yval_scalar, xval_scalar in pos_item_host:
@@ -412,19 +415,15 @@ def interpret_translation(
 
             # Final check of bounds for this specific yval, xval pair
             if (ymin <= yval_int) and (yval_int <= ymax) and (xmin <= xval_int) and (xval_int <= xmax):
-                subI1_cp = extract_overlap_subregion(image1_cp, yval_int, xval_int)
-                subI2_cp = extract_overlap_subregion(image2_cp, -yval_int, -xval_int)
+                subI1_backend = extract_overlap_subregion(image1_backend, yval_int, xval_int)
+                subI2_backend = extract_overlap_subregion(image2_backend, -yval_int, -xval_int)
                 
-                # ncc is called with CuPy arrays, returns Python float
-                ncc_val = ncc(subI1_cp, subI2_cp) 
+                # ncc is called with backend arrays, returns Python float
+                ncc_val = ncc(subI1_backend, subI2_backend) 
                 ncc_calls += 1
                 if ncc_val > _ncc: # _ncc is Python float
                     _ncc = ncc_val
                     y_best = yval_int
                     x_best = xval_int
-    
-    # print(f"Candidate evaluation time: {(time.time() - profiling_eval_start)*1000:.2f}ms")
-    # print(f"Number of NCC calls: {ncc_calls}")
-    # print(f"Total execution time: {(time.time() - profiling_total_start)*1000:.2f}ms")
     
     return _ncc, y_best, x_best
