@@ -242,13 +242,16 @@ class StitchingGUI(QWidget):
         self.registrationCombo = QComboBox(self)
         self.registrationCombo.addItems(["No", "Yes"])
         self.mainLayout.addWidget(self.registrationCombo, 1, 1)
-
-        # Tensor Backend section
+        
+        # Tensor Backend section (conditional on registration)
         self.tensorBackendLabel = QLabel("Compute Backend:", self)
         self.mainLayout.addWidget(self.tensorBackendLabel, 2, 0)
         self.tensorBackendCombo = QComboBox(self)
         self.mainLayout.addWidget(self.tensorBackendCombo, 2, 1)
+        
+        # Initialize backend options and setup connections
         self._populate_tensor_backend_options()
+        self._setup_registration_connections()
 
         # Output format section
         self.outputFormatLabel = QLabel("Output Format:", self)
@@ -488,8 +491,12 @@ class StitchingGUI(QWidget):
                 apply_mip=(z_layer_mode == 3),  # Set apply_mip based on the combo box index
             )
 
-            # Check if registration is requested
-            perform_registration = self.registrationCombo.currentText() == "Yes"
+            # Check if registration is requested and available
+            perform_registration = (
+                self.registrationCombo.currentText() == "Yes" and 
+                self._has_registration_backends and
+                self.tensorBackendCombo.isEnabled()
+            )
 
             # Create and configure the stitcher thread
             self.stitcher = StitcherThread(
@@ -657,34 +664,81 @@ class StitchingGUI(QWidget):
         ]
         
         # Test which backends are actually available
-        available_backends = []
+        self._available_backends = []
         for display_name, engine_name in backend_options:
             if engine_name is None:  # Auto option
-                available_backends.append((display_name, engine_name))
+                self._available_backends.append((display_name, engine_name))
             else:
                 try:
-                    # Test if backend can be created
-                    backend = create_tensor_backend(engine_name, test_functionality=False)
+                    # Test if backend can be created and actually works (no fallback)
+                    backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
                     gpu_status = " (GPU)" if backend.is_gpu else " (CPU)"
                     display_with_status = display_name.replace("(GPU/CPU)", gpu_status).replace("(NVIDIA GPU)", gpu_status)
-                    available_backends.append((display_with_status, engine_name))
+                    self._available_backends.append((display_with_status, engine_name))
                 except Exception:
                     # Backend not available, skip it
                     continue
         
-        # Populate combo box
+        # Store if any registration backends are available (excluding NumPy-only)
+        self._has_registration_backends = len([b for b in self._available_backends if b[1] != "numpy"]) > 1
+        
+        # Initially populate based on current registration selection
+        self._update_backend_dropdown()
+
+    def _setup_registration_connections(self) -> None:
+        """Setup connections for registration dropdown changes."""
+        self.registrationCombo.currentIndexChanged.connect(self.onRegistrationChanged)
+        # Set initial state
+        self.onRegistrationChanged(0)  # Start with "No" selected
+
+    def onRegistrationChanged(self, idx: int) -> None:
+        """Handle registration selection changes."""
+        registration_enabled = self.registrationCombo.currentText() == "Yes"
+        
+        if registration_enabled:
+            if self._has_registration_backends:
+                # Show backend dropdown with available options
+                self.tensorBackendLabel.setVisible(True)
+                self.tensorBackendCombo.setVisible(True)
+                self._update_backend_dropdown()
+            else:
+                # Show unavailable message
+                self.tensorBackendLabel.setVisible(True) 
+                self.tensorBackendCombo.setVisible(True)
+                self.tensorBackendCombo.clear()
+                self.tensorBackendCombo.addItem("Registration unavailable")
+                self.tensorBackendCombo.setToolTip(
+                    "Registration requires PyTorch or CuPy. Install with:\n"
+                    "pip install torch torchvision  # For PyTorch\n"
+                    "pip install cupy-cuda12x  # For CuPy (NVIDIA GPU)"
+                )
+                self.tensorBackendCombo.setEnabled(False)
+        else:
+            # Hide backend selection when registration is disabled
+            self.tensorBackendLabel.setVisible(False)
+            self.tensorBackendCombo.setVisible(False)
+
+    def _update_backend_dropdown(self) -> None:
+        """Update the backend dropdown with available options."""
         self.tensorBackendCombo.clear()
+        self.tensorBackendCombo.setEnabled(True)
         self._backend_mapping = {}
-        for i, (display_name, engine_name) in enumerate(available_backends):
+        
+        for i, (display_name, engine_name) in enumerate(self._available_backends):
             self.tensorBackendCombo.addItem(display_name)
             self._backend_mapping[i] = engine_name
         
-        # Connect change handler
+        # Connect change handler if not already connected
+        try:
+            self.tensorBackendCombo.currentIndexChanged.disconnect()
+        except:
+            pass
         self.tensorBackendCombo.currentIndexChanged.connect(self.onTensorBackendChanged)
         
         # Set default to auto
-        self.tensorBackendCombo.setCurrentIndex(0)
-        self._update_backend_status()
+        if len(self._available_backends) > 0:
+            self.tensorBackendCombo.setCurrentIndex(0)
+            self._update_backend_status()
 
     def onTensorBackendChanged(self, idx: int) -> None:
         """Handle tensor backend selection changes."""
@@ -698,14 +752,14 @@ class StitchingGUI(QWidget):
             
             if engine_name is None:
                 # Auto selection - detect current backend
-                current_backend = create_tensor_backend(None, test_functionality=False)
+                current_backend = create_tensor_backend(None, test_functionality=True)
                 backend_name = current_backend.name
                 gpu_status = "GPU" if current_backend.is_gpu else "CPU"
                 status_text = f"Auto-selected: {backend_name.upper()} ({gpu_status})"
             else:
                 # Manual selection
                 try:
-                    selected_backend = create_tensor_backend(engine_name, test_functionality=False)
+                    selected_backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
                     backend_name = selected_backend.name
                     gpu_status = "GPU" if selected_backend.is_gpu else "CPU"
                     status_text = f"Selected: {backend_name.upper()} ({gpu_status})"
