@@ -55,6 +55,7 @@ from ._stage_model import replace_invalid_translations
 from ._translation_computation import interpret_translation
 from ._translation_computation import multi_peak_max
 from ._translation_computation import pcm
+from ._tensor_backend import TensorBackend, create_tensor_backend
 
 # Set start method to 'spawn' for CUDA safety in multiprocessing
 # 'fork' (default on linux) can cause issues with CUDA context
@@ -68,6 +69,33 @@ except RuntimeError:
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+# Global tensor backend instance
+_tensor_backend: Optional[TensorBackend] = None
+
+def get_tensor_backend() -> TensorBackend:
+    """Get or create the global tensor backend instance."""
+    global _tensor_backend
+    if _tensor_backend is None:
+        _tensor_backend = create_tensor_backend()
+    return _tensor_backend
+
+def set_tensor_backend(engine: Optional[str] = None) -> TensorBackend:
+    """Set the global tensor backend to use a specific engine.
+    
+    Parameters
+    ----------
+    engine : Optional[str]
+        Preferred engine ('cupy', 'torch', 'numpy'), None for auto
+        
+    Returns
+    -------
+    TensorBackend
+        The created backend instance
+    """
+    global _tensor_backend
+    _tensor_backend = create_tensor_backend(engine)
+    return _tensor_backend
 
 # Constants for file handling
 DEFAULT_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_(?P<z_level>\d+)_", re.I)
@@ -403,12 +431,46 @@ def register_tiles_batched(
     overlap_diff_threshold: float = 10,
     pou: float = 3,
     ncc_threshold: float = 0.5,
-    z_slice_to_keep: Optional[int] = 0
+    z_slice_to_keep: Optional[int] = 0,
+    tensor_backend_engine: Optional[str] = None
 ) -> Tuple[pd.DataFrame, dict]:
-    """Register tiles using memory-constrained batched processing."""
+    """Register tiles using memory-constrained batched processing.
+    
+    Parameters
+    ----------
+    selected_tiff_paths : List[Path]
+        List of paths to TIFF files to register
+    region_coords : pd.DataFrame
+        DataFrame containing tile coordinates
+    edge_width : int
+        Width of edge strips for correlation
+    overlap_diff_threshold : float
+        Allowed difference from initial guess (percentage)
+    pou : float
+        Percent overlap uncertainty
+    ncc_threshold : float
+        Normalized cross correlation threshold
+    z_slice_to_keep : Optional[int]
+        Z-slice to use for registration
+    tensor_backend_engine : Optional[str]
+        Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+        
+    Returns
+    -------
+    Tuple[pd.DataFrame, dict]
+        Registration results and properties dictionary
+    """
     
     if not selected_tiff_paths:
         return pd.DataFrame(), {}
+    
+    # Set tensor backend if specified
+    if tensor_backend_engine is not None:
+        backend = set_tensor_backend(tensor_backend_engine)
+        print(f"Using tensor backend: {backend.name} ({'GPU' if backend.is_gpu else 'CPU'})")
+    else:
+        backend = get_tensor_backend()
+        print(f"Using tensor backend: {backend.name} ({'GPU' if backend.is_gpu else 'CPU'})")
     
     # Calculate safe batch size
     batch_size = calculate_safe_batch_size(selected_tiff_paths[0])
@@ -1668,7 +1730,8 @@ def register_and_update_coordinates(
     ncc_threshold: float = 0.5,
     skip_backup: bool = False,
     z_slice_for_registration: Optional[int] = 0,
-    edge_width: int = DEFAULT_EDGE_WIDTH
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    tensor_backend_engine: Optional[str] = None
 ) -> pd.DataFrame:
     """Register tiles and update stage coordinates for all regions.
     
@@ -1694,6 +1757,8 @@ def register_and_update_coordinates(
         Which z-slice to use for registration (default: 0)
     edge_width : int
         Width of the edge strips (in pixels) to use for registration
+    tensor_backend_engine : Optional[str]
+        Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
         
     Returns
     -------
@@ -1831,7 +1896,8 @@ def register_and_update_coordinates(
                 overlap_diff_threshold=overlap_diff_threshold,
                 pou=pou,
                 ncc_threshold=ncc_threshold,
-                z_slice_to_keep=z_slice_for_registration
+                z_slice_to_keep=z_slice_for_registration,
+                tensor_backend_engine=tensor_backend_engine
             )
             
             # Calculate pixel size
@@ -1859,25 +1925,18 @@ def register_and_update_coordinates(
             
         except Exception as e:
             print(f"Error processing region {region}: {e}")
-            # Clean up GPU memory after error
-            try:
-                import cupy as cp
-                # Reset CUDA device
-                cp.cuda.Device().synchronize()
-                cp.cuda.runtime.deviceReset()
-                # Free memory pools
-            except:
-                pass
+        # Clean up memory after error
+        try:
+            backend = get_tensor_backend()
+            backend.cleanup_memory()
+        except:
+            pass
             continue
         
-        # Force GPU memory cleanup between regions
+        # Force memory cleanup between regions
         try:
-            import cupy as cp
-            mempool = cp.get_default_memory_pool()
-            pinned_mempool = cp.get_default_pinned_memory_pool()
-            mempool.free_all_blocks()
-            pinned_mempool.free_all_blocks()
-            cp.cuda.Device().synchronize()
+            backend = get_tensor_backend()
+            backend.cleanup_memory()
         except:
             pass
     
@@ -1894,7 +1953,8 @@ def process_multiple_timepoints(
     overlap_diff_threshold: float = 10,
     pou: float = 3,
     ncc_threshold: float = 0.5,
-    edge_width: int = DEFAULT_EDGE_WIDTH
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    tensor_backend_engine: Optional[str] = None
 ) -> Dict[int, pd.DataFrame]:
     """Process multiple timepoints from a directory.
     
@@ -1910,6 +1970,8 @@ def process_multiple_timepoints(
         Normalized cross correlation threshold
     edge_width : int
         Width of the edge strips (in pixels) to use for registration
+    tensor_backend_engine : Optional[str]
+        Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
         
     Returns
     -------
@@ -1963,7 +2025,8 @@ def process_multiple_timepoints(
                 ncc_threshold=ncc_threshold,
                 skip_backup=True,  # Skip backup since we already made one
                 z_slice_for_registration=0,
-                edge_width=edge_width
+                edge_width=edge_width,
+                tensor_backend_engine=tensor_backend_engine
             )
             results[timepoint] = updated_coords
             print(f"Successfully processed timepoint {timepoint}")
