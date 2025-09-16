@@ -142,10 +142,10 @@ class StitcherThread(QThread):
                 logging.info("Starting registration process...")
                 results = process_multiple_timepoints(
                     base_directory=self.image_directory,
-                    overlap_diff_threshold=5,    # Tighter: was 10, now 5
-                    pou=2,                       # Tighter: was 3, now 2  
-                    ncc_threshold=0.7,           # Higher: was 0.5, now 0.7
-                    edge_width=256,
+                    overlap_diff_threshold=10,    
+                    pou=3,                       
+                    ncc_threshold=0.5,           
+                    edge_width=195,
                     tensor_backend_engine=self.tensor_backend_engine
                 )
                 logging.info("Registration completed successfully")
@@ -184,10 +184,10 @@ class RegistrationThread(QThread):
             # Process all timepoints
             results = process_multiple_timepoints(
                 base_directory=self.image_directory,
-                overlap_diff_threshold=5,    # Tighter: was 10, now 5
-                pou=2,                       # Tighter: was 3, now 2
-                ncc_threshold=0.7,           # Higher: was 0.5, now 0.7
-                edge_width=256,
+                overlap_diff_threshold=10,    
+                pou=3,                      
+                ncc_threshold=0.5,           
+                edge_width=195,
                 tensor_backend_engine=self.tensor_backend_engine
             )
             
