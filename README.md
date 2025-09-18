@@ -1,25 +1,49 @@
 # image-stitcher
+
+High-performance image stitching for microscopy with GPU acceleration support.
+
+## Features
+
+- Automatic selection of CuPy, PyTorch, or NumPy backends
+- GPU Acceleration: significant performance improvements for large-scale image registration  
+- Graceful fallback to CPU processing if GPU is unavailable
+- Works on Linux, our system of preference, and Windows
+
 ## Setup
+
 ### Pre-setup for linux (e.g. ubuntu)
 
 On linux, ensure you have the necessary system dependencies installed and
-conda environment setup. We provide a setup script for ubuntu 22.04 LTS
+conda environment setup. We provide a setup script for ubuntu 22.04
 that does this automatically:
 
-```
+```bash
 ./setup_ubuntu_22_04.sh
 ```
 
 This will set up a conda environment called `image-stitcher` with all the required dependencies,
-and should let you run the examples below when activated with `conda activate image-stitcher`.
+including PyTorch with CUDA support for GPU acceleration.
 
-If you want to run our registration module (Ubuntu only coompatible with Driver 535.x), run the following shell command.
-```
+### GPU Acceleration (Optional)
+
+For maximum performance, install CuPy for NVIDIA GPU acceleration:
+
+```bash
+# Install CuPy for best GPU performance (Ubuntu only, compatible with Driver 535.x)
 ./setup_gpu_ubuntu_22_04.sh
 ```
 
-This will add GPU compatibility to the environment called `image-stitcher`, and should let you run the registration module of the GUI.
+The system will automatically detect and use the best available backend:
+- **CuPy** (preferred) - Best performance for NVIDIA GPUs
+- **PyTorch** (included) - Good performance, wider hardware support
+- **NumPy** (fallback) - CPU-only, always available
 
+### Test Your Installation
+
+```bash
+conda activate image-stitcher
+python test_dependencies.py
+```
 ### Pre-setup for Non-Ubuntu OS
 
 For other environments, you will need to manually replicate the setup steps in `./setup_ubuntu_22_04.sh`.
@@ -40,6 +64,17 @@ To run the gui manually without the helper script, you can run the following fro
 ```
 python -m image_stitcher.stitcher_gui
 ```
+
+#### GPU Acceleration in GUI
+
+The GUI includes a **Compute Backend** dropdown that allows you to select the tensor backend:
+
+- **Auto (Recommended)** - Automatically selects the best available backend
+- **NumPy (CPU)** - CPU-only processing using NumPy
+- **PyTorch (GPU/CPU)** - Uses PyTorch with GPU acceleration if available
+- **CuPy (NVIDIA GPU)** - Maximum performance with NVIDIA GPU acceleration
+
+The dropdown shows the actual backend status (GPU/CPU).. Backend selection affects the registration process performance significantly.
 
 ## Running via the CLI
 

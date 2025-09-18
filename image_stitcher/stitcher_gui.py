@@ -38,6 +38,7 @@ from .parameters import (
 from .stitcher import ProgressCallbacks, Stitcher
 from .registration import register_and_update_coordinates
 from .registration.tile_registration import process_multiple_timepoints
+from .registration._tensor_backend import create_tensor_backend, TensorBackend
 
 
 # Enum for Flatfield Modes
@@ -118,11 +119,12 @@ class DragDropArea(QLabel):
 
 
 class StitcherThread(QThread):
-    def __init__(self, params: StitchingParameters, perform_registration: bool, image_directory: str) -> None:
+    def __init__(self, params: StitchingParameters, perform_registration: bool, image_directory: str, tensor_backend_engine: str | None = None) -> None:
         super().__init__()
         self.params = params
         self.perform_registration = perform_registration
         self.image_directory = image_directory
+        self.tensor_backend_engine = tensor_backend_engine
         self.registration_complete = False
         self.registration_error = None
         self.callbacks = ProgressCallbacks(
@@ -140,10 +142,11 @@ class StitcherThread(QThread):
                 logging.info("Starting registration process...")
                 results = process_multiple_timepoints(
                     base_directory=self.image_directory,
-                    overlap_diff_threshold=5,    # Tighter: was 10, now 5
-                    pou=2,                       # Tighter: was 3, now 2  
-                    ncc_threshold=0.7,           # Higher: was 0.5, now 0.7
-                    edge_width=256
+                    overlap_diff_threshold=10,    
+                    pou=3,                       
+                    ncc_threshold=0.5,           
+                    edge_width=195,
+                    tensor_backend_engine=self.tensor_backend_engine
                 )
                 logging.info("Registration completed successfully")
                 self.registration_complete = True
@@ -169,21 +172,23 @@ class StitcherThread(QThread):
 
 
 class RegistrationThread(QThread):
-    def __init__(self, image_directory: str, csv_path: str | None, output_csv_path: str | None) -> None:
+    def __init__(self, image_directory: str, csv_path: str | None, output_csv_path: str | None, tensor_backend_engine: str | None = None) -> None:
         super().__init__()
         self.image_directory = image_directory
         self.csv_path = csv_path
         self.output_csv_path = output_csv_path
+        self.tensor_backend_engine = tensor_backend_engine
 
     def run(self) -> None:
         try:
             # Process all timepoints
             results = process_multiple_timepoints(
                 base_directory=self.image_directory,
-                overlap_diff_threshold=5,    # Tighter: was 10, now 5
-                pou=2,                       # Tighter: was 3, now 2
-                ncc_threshold=0.7,           # Higher: was 0.5, now 0.7
-                edge_width=256
+                overlap_diff_threshold=10,    
+                pou=3,                      
+                ncc_threshold=0.5,           
+                edge_width=195,
+                tensor_backend_engine=self.tensor_backend_engine
             )
             
             # Emit success signal with number of processed timepoints
@@ -237,31 +242,41 @@ class StitchingGUI(QWidget):
         self.registrationCombo = QComboBox(self)
         self.registrationCombo.addItems(["No", "Yes"])
         self.mainLayout.addWidget(self.registrationCombo, 1, 1)
+        
+        # Tensor Backend section (conditional on registration)
+        self.tensorBackendLabel = QLabel("Compute Backend:", self)
+        self.mainLayout.addWidget(self.tensorBackendLabel, 2, 0)
+        self.tensorBackendCombo = QComboBox(self)
+        self.mainLayout.addWidget(self.tensorBackendCombo, 2, 1)
+        
+        # Initialize backend options and setup connections
+        self._populate_tensor_backend_options()
+        self._setup_registration_connections()
 
         # Output format section
         self.outputFormatLabel = QLabel("Output Format:", self)
-        self.mainLayout.addWidget(self.outputFormatLabel, 2, 0)
+        self.mainLayout.addWidget(self.outputFormatLabel, 3, 0)
         self.outputFormatCombo = QComboBox(self)
         self.outputFormatCombo.addItems(["OME-ZARR"])  # Removed OME-TIFF as requested
-        self.mainLayout.addWidget(self.outputFormatCombo, 2, 1)
+        self.mainLayout.addWidget(self.outputFormatCombo, 3, 1)
 
         # Output compression section
         self.compressionLabel = QLabel("Output Compression:", self)
-        self.mainLayout.addWidget(self.compressionLabel, 3, 0)
+        self.mainLayout.addWidget(self.compressionLabel, 4, 0)
         self.outputCompression = QComboBox(self)
         self.outputCompression.addItems(["default", "none"])
-        self.mainLayout.addWidget(self.outputCompression, 3, 1)
+        self.mainLayout.addWidget(self.outputCompression, 4, 1)
 
         # Pyramid checkbox section - now with checkbox on the right
         self.pyramidLabel = QLabel("Infer levels for output image pyramid:", self)
-        self.mainLayout.addWidget(self.pyramidLabel, 4, 0)
+        self.mainLayout.addWidget(self.pyramidLabel, 5, 0)
         self.pyramidCheckbox = QCheckBox(self)
         self.pyramidCheckbox.setChecked(True)
-        self.mainLayout.addWidget(self.pyramidCheckbox, 4, 1)
+        self.mainLayout.addWidget(self.pyramidCheckbox, 5, 1)
 
         # Flatfield Correction section
         self.flatfieldModeLabel = QLabel("Correction Mode:", self)
-        self.mainLayout.addWidget(self.flatfieldModeLabel, 5, 0)
+        self.mainLayout.addWidget(self.flatfieldModeLabel, 6, 0)
         self.flatfieldModeCombo = QComboBox(self)
         self.flatfieldModeCombo.addItems(
             [
@@ -271,54 +286,54 @@ class StitchingGUI(QWidget):
             ]
         )
         self.flatfieldModeCombo.currentIndexChanged.connect(self.onFlatfieldModeChanged)
-        self.mainLayout.addWidget(self.flatfieldModeCombo, 5, 1)
+        self.mainLayout.addWidget(self.flatfieldModeCombo, 6, 1)
 
         self.flatfieldLoadLabel = QLabel("Load Flatfield:", self)
-        self.mainLayout.addWidget(self.flatfieldLoadLabel, 6, 0)
+        self.mainLayout.addWidget(self.flatfieldLoadLabel, 7, 0)
         self.flatfieldLoadLabel.setVisible(False) # Initially hidden
         self.loadFlatfieldDropArea = DragDropArea("Drag & Drop Flatfield Directory Here", self)
         self.loadFlatfieldDropArea.path_dropped.connect(self.onLoadFlatfieldDropped)
-        self.mainLayout.addWidget(self.loadFlatfieldDropArea, 6, 1)
+        self.mainLayout.addWidget(self.loadFlatfieldDropArea, 7, 1)
         self.loadFlatfieldDropArea.setVisible(False) # Initially hidden
 
         # Z-Stack Options section
         self.zLayerLabel = QLabel("Processing Mode:", self)
-        self.mainLayout.addWidget(self.zLayerLabel, 7, 0)
+        self.mainLayout.addWidget(self.zLayerLabel, 8, 0)
         self.zLayerModeCombo = QComboBox(self)
         self.zLayerModeCombo.addItems(["Middle Layer", "All Layers", "Specific Layer", "Maximum Intensity Projection (MIP)"])
         self.zLayerModeCombo.currentIndexChanged.connect(self.onZLayerModeChanged)
-        self.mainLayout.addWidget(self.zLayerModeCombo, 7, 1)
+        self.mainLayout.addWidget(self.zLayerModeCombo, 8, 1)
 
         self.zLayerSpinLabel = QLabel("Select Z-Layer Index:", self)
-        self.mainLayout.addWidget(self.zLayerSpinLabel, 8, 0)
+        self.mainLayout.addWidget(self.zLayerSpinLabel, 9, 0)
         self.zLayerSpinLabel.setVisible(False) 
 
         self.zLayerSpinBox = QSpinBox(self)
         self.zLayerSpinBox.setMinimum(0)
         self.zLayerSpinBox.setMaximum(999)  # Will be updated based on actual data
-        self.mainLayout.addWidget(self.zLayerSpinBox, 8, 1)
+        self.mainLayout.addWidget(self.zLayerSpinBox, 9, 1)
         self.zLayerSpinBox.setVisible(False) 
 
         # Status and Progress section
         self.statusLabel = QLabel("Status: Ready", self)
-        self.mainLayout.addWidget(self.statusLabel, 9, 0, 1, 2)  
+        self.mainLayout.addWidget(self.statusLabel, 10, 0, 1, 2)  
 
         self.progressBar = QProgressBar(self)
         self.progressBar.hide()
-        self.mainLayout.addWidget(self.progressBar, 10, 0, 1, 2)  
+        self.mainLayout.addWidget(self.progressBar, 11, 0, 1, 2)  
 
         # Action Buttons
         self.startBtn = QPushButton("Start Stitching", self)
         self.startBtn.clicked.connect(self.onStitchingStart)
-        self.mainLayout.addWidget(self.startBtn, 11, 0)
+        self.mainLayout.addWidget(self.startBtn, 12, 0)
 
         self.viewBtn = QPushButton("View Output", self)
         self.viewBtn.clicked.connect(self.onViewOutput)
         self.viewBtn.setEnabled(False)
-        self.mainLayout.addWidget(self.viewBtn, 11, 1)
+        self.mainLayout.addWidget(self.viewBtn, 12, 1)
         
         # Add stretch to push everything to the top
-        self.mainLayout.setRowStretch(12, 1) 
+        self.mainLayout.setRowStretch(13, 1) 
 
         self.setWindowTitle("Cephla Image Stitcher")
         self.setGeometry(300, 300, 600, 400)
@@ -476,14 +491,19 @@ class StitchingGUI(QWidget):
                 apply_mip=(z_layer_mode == 3),  # Set apply_mip based on the combo box index
             )
 
-            # Check if registration is requested
-            perform_registration = self.registrationCombo.currentText() == "Yes"
+            # Check if registration is requested and available
+            perform_registration = (
+                self.registrationCombo.currentText() == "Yes" and 
+                self._has_registration_backends and
+                self.tensorBackendCombo.isEnabled()
+            )
 
             # Create and configure the stitcher thread
             self.stitcher = StitcherThread(
                 params=params,
                 perform_registration=perform_registration,
-                image_directory=self.inputDirectory
+                image_directory=self.inputDirectory,
+                tensor_backend_engine=self._get_selected_tensor_backend()
             )
 
             # Set up callbacks
@@ -632,6 +652,130 @@ class StitchingGUI(QWidget):
         else:
             self.zLayerSpinLabel.setVisible(False)
             self.zLayerSpinBox.setVisible(False)
+
+    def _populate_tensor_backend_options(self) -> None:
+        """Populate the tensor backend dropdown with available options."""
+        # Define backend options with display names
+        backend_options = [
+            ("Auto (Recommended)", None),
+            ("NumPy (CPU)", "numpy"),
+            ("PyTorch (GPU/CPU)", "torch"), 
+            ("CuPy (NVIDIA GPU)", "cupy")
+        ]
+        
+        # Test which backends are actually available
+        self._available_backends = []
+        for display_name, engine_name in backend_options:
+            if engine_name is None:  # Auto option
+                self._available_backends.append((display_name, engine_name))
+            else:
+                try:
+                    # Test if backend can be created and actually works (no fallback)
+                    backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    gpu_status = " (GPU)" if backend.is_gpu else " (CPU)"
+                    display_with_status = display_name.replace("(GPU/CPU)", gpu_status).replace("(NVIDIA GPU)", gpu_status)
+                    self._available_backends.append((display_with_status, engine_name))
+                except Exception:
+                    # Backend not available, skip it
+                    continue
+        
+        # Store if any registration backends are available (excluding NumPy-only)
+        self._has_registration_backends = len([b for b in self._available_backends if b[1] != "numpy"]) > 1
+        
+        # Initially populate based on current registration selection
+        self._update_backend_dropdown()
+
+    def _setup_registration_connections(self) -> None:
+        """Setup connections for registration dropdown changes."""
+        self.registrationCombo.currentIndexChanged.connect(self.onRegistrationChanged)
+        # Set initial state
+        self.onRegistrationChanged(0)  # Start with "No" selected
+
+    def onRegistrationChanged(self, idx: int) -> None:
+        """Handle registration selection changes."""
+        registration_enabled = self.registrationCombo.currentText() == "Yes"
+        
+        if registration_enabled:
+            if self._has_registration_backends:
+                # Show backend dropdown with available options
+                self.tensorBackendLabel.setVisible(True)
+                self.tensorBackendCombo.setVisible(True)
+                self._update_backend_dropdown()
+            else:
+                # Show unavailable message
+                self.tensorBackendLabel.setVisible(True) 
+                self.tensorBackendCombo.setVisible(True)
+                self.tensorBackendCombo.clear()
+                self.tensorBackendCombo.addItem("Registration unavailable")
+                self.tensorBackendCombo.setToolTip(
+                    "Registration requires PyTorch or CuPy. Install with:\n"
+                    "pip install torch torchvision  # For PyTorch\n"
+                    "pip install cupy-cuda12x  # For CuPy (NVIDIA GPU)"
+                )
+                self.tensorBackendCombo.setEnabled(False)
+        else:
+            # Hide backend selection when registration is disabled
+            self.tensorBackendLabel.setVisible(False)
+            self.tensorBackendCombo.setVisible(False)
+
+    def _update_backend_dropdown(self) -> None:
+        """Update the backend dropdown with available options."""
+        self.tensorBackendCombo.clear()
+        self.tensorBackendCombo.setEnabled(True)
+        self._backend_mapping = {}
+        
+        for i, (display_name, engine_name) in enumerate(self._available_backends):
+            self.tensorBackendCombo.addItem(display_name)
+            self._backend_mapping[i] = engine_name
+        
+        # Connect change handler if not already connected
+        try:
+            self.tensorBackendCombo.currentIndexChanged.disconnect()
+        except:
+            pass
+        self.tensorBackendCombo.currentIndexChanged.connect(self.onTensorBackendChanged)
+        
+        # Set default to auto
+        if len(self._available_backends) > 0:
+            self.tensorBackendCombo.setCurrentIndex(0)
+            self._update_backend_status()
+
+    def onTensorBackendChanged(self, idx: int) -> None:
+        """Handle tensor backend selection changes."""
+        self._update_backend_status()
+
+    def _update_backend_status(self) -> None:
+        """Update status to show current backend selection."""
+        try:
+            selected_idx = self.tensorBackendCombo.currentIndex()
+            engine_name = self._backend_mapping.get(selected_idx)
+            
+            if engine_name is None:
+                # Auto selection - detect current backend
+                current_backend = create_tensor_backend(None, test_functionality=True)
+                backend_name = current_backend.name
+                gpu_status = "GPU" if current_backend.is_gpu else "CPU"
+                status_text = f"Auto-selected: {backend_name.upper()} ({gpu_status})"
+            else:
+                # Manual selection
+                try:
+                    selected_backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    backend_name = selected_backend.name
+                    gpu_status = "GPU" if selected_backend.is_gpu else "CPU"
+                    status_text = f"Selected: {backend_name.upper()} ({gpu_status})"
+                except Exception as e:
+                    status_text = f"Backend {engine_name} unavailable: {str(e)[:50]}..."
+            
+            # Update tooltip with backend info
+            self.tensorBackendCombo.setToolTip(status_text)
+            
+        except Exception as e:
+            self.tensorBackendCombo.setToolTip(f"Backend error: {str(e)[:50]}...")
+
+    def _get_selected_tensor_backend(self) -> str | None:
+        """Get the currently selected tensor backend engine name."""
+        selected_idx = self.tensorBackendCombo.currentIndex()
+        return self._backend_mapping.get(selected_idx)
 
     def setupConnections(self) -> None:
         assert self.stitcher is not None

@@ -1,12 +1,15 @@
 name: image-stitcher
 channels:
   - conda-forge
+  - pytorch
+  - nvidia
 dependencies:
   - python=3.10
   - aicsimageio
   - dask-image
   - numpy
   - ome-zarr
+  - zarr
   - pandas
   - psutil
   - pydantic>=2.10.5
@@ -14,7 +17,7 @@ dependencies:
   - pydantic-settings>=2.7.1
   - napari-ome-zarr
   - napari[all]
-  - pyqt
+  - pyqt5
   # Core dependencies for image processing
   - tifffile
   - tqdm
@@ -23,6 +26,12 @@ dependencies:
   - matplotlib
   # Testing dependencies
   - pytest
+  # Tensor backend dependencies (optional GPU acceleration)
+  # Note: These are optional and the system will fall back to NumPy if not available
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::pytorch-cuda=12.1  # For CUDA 12.x compatibility
+  # CuPy will be installed via pip in setup scripts for better compatibility
   # NOTE: basicpy must be installed in your conda environment with pip.  Run the ./setup_ubuntu_22_04.sh script
   # to handle this, or with your conda environment activated run pip install basicpy.  There is no basicpy
   # package on conda-forge, and the installations instructions suggest pip:
