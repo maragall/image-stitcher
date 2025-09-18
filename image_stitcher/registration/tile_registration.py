@@ -52,9 +52,10 @@ from ._stage_model import filter_by_overlap_and_correlation
 from ._stage_model import filter_by_repeatability
 from ._stage_model import filter_outliers
 from ._stage_model import replace_invalid_translations
-from ._translation_computation import interpret_translation
+from ._translation_computation import interpret_translation, interpret_translation_optimized, interpret_translation_subpixel, interpret_translation_ransac
 from ._translation_computation import multi_peak_max
-from ._translation_computation import pcm
+from ._translation_computation import pcm, pcm_subpixel
+from ._translation_computation import OptimizationConfig, SubpixelConfig, RANSACConfig
 from ._tensor_backend import TensorBackend, create_tensor_backend
 
 # Set start method to 'spawn' for CUDA safety in multiprocessing
@@ -213,7 +214,7 @@ def group_neighborhoods_into_batches(
     
     # Estimate memory per image
     first_image = tifffile.imread(str(selected_tiff_paths[0]))
-    bytes_per_image = first_image.nbytes * 4  # 4x overhead
+    bytes_per_image = first_image.nbytes * 8  # 8x overhead for float64 operations
     del first_image
     gc.collect()
     
@@ -371,10 +372,15 @@ def compute_single_translation(
         
         yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
         
-        # interpret_translation
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation(
+        # interpret_translation with RANSAC + subpixel + optimization (ultimate method)
+        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
             edge1, edge2, yins_edge, xins_edge, 
-            *lims_edge_relative[0], *lims_edge_relative[1]
+            *lims_edge_relative[0], *lims_edge_relative[1],
+            n=10,  # More candidates for RANSAC
+            ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
+            subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
+            use_continuous_optimization=True,
+            optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
         # Convert to global coordinates
@@ -394,7 +400,7 @@ def calculate_safe_batch_size(first_image_path: Path, memory_fraction: float = 0
     del first_image
     gc.collect()
     
-    processing_overhead = 4  # Conservative 4x multiplier
+    processing_overhead = 8  # Conservative 8x multiplier for float64 operations
     total_per_image = image_memory * processing_overhead
     
     available_memory = psutil.virtual_memory().available * memory_fraction
@@ -607,7 +613,7 @@ def register_tiles_batched(
     
     # Calculate memory constraints
     first_image = tifffile.imread(str(selected_tiff_paths[0]))
-    max_memory = calculate_safe_batch_size(selected_tiff_paths[0]) * first_image.nbytes * 4
+    max_memory = calculate_safe_batch_size(selected_tiff_paths[0]) * first_image.nbytes * 8
     del first_image
     gc.collect()
     
@@ -778,11 +784,108 @@ def register_tiles_batched(
     
     # Global optimization
     print("DEBUG: Calling compute_maximum_spanning_tree...")
+    
+    # COMPREHENSIVE DEBUG OUTPUT
+    print(f"\n=== REGISTRATION DEBUG REPORT ===")
+    print(f"Parameters used:")
+    print(f"  - edge_width: {edge_width}")
+    print(f"  - ncc_threshold: {ncc_threshold}")
+    print(f"  - pou: {pou}")
+    print(f"  - overlap_diff_threshold: {overlap_diff_threshold}")
+    
+    # Analyze NCC distributions for each direction
+    for direction in ["left", "top"]:
+        ncc_col = f"{direction}_ncc_first"
+        if ncc_col in master_grid.columns:
+            ncc_values = master_grid[ncc_col].dropna()
+            if len(ncc_values) > 0:
+                print(f"\n{direction.upper()} direction NCC statistics:")
+                print(f"  - Count: {len(ncc_values)}")
+                print(f"  - Mean: {ncc_values.mean():.4f}")
+                print(f"  - Std: {ncc_values.std():.4f}")
+                print(f"  - Min: {ncc_values.min():.4f}")
+                print(f"  - Max: {ncc_values.max():.4f}")
+                print(f"  - Above threshold ({ncc_threshold}): {(ncc_values > ncc_threshold).sum()}")
+                
+                # Show distribution in bins
+                bins = [0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+                hist, _ = np.histogram(ncc_values, bins=bins)
+                print(f"  - NCC distribution:")
+                for i in range(len(bins)-1):
+                    print(f"    [{bins[i]:.1f}-{bins[i+1]:.1f}): {hist[i]} tiles")
+    
+    # Show edge width impact
+    print(f"\nEdge width analysis:")
+    print(f"  - edge_width = {edge_width}")
+    print(f"  - Image dimensions: {full_sizeY} x {full_sizeX}")
+    print(f"  - Actual edge width used (left): {min(edge_width, full_sizeX)} ({100*min(edge_width, full_sizeX)/full_sizeX:.1f}% of image width)")
+    print(f"  - Actual edge width used (top): {min(edge_width, full_sizeY)} ({100*min(edge_width, full_sizeY)/full_sizeY:.1f}% of image height)")
+    
+    if edge_width >= full_sizeX * 0.5:
+        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image width ({full_sizeX})")
+        print(f"     This may cause unstable registration as overlapping regions become too large!")
+    if edge_width >= full_sizeY * 0.5:
+        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image height ({full_sizeY})")
+        print(f"     This may cause unstable registration as overlapping regions become too large!")
+    
     tree = compute_maximum_spanning_tree(master_grid)
+    
+    # Analyze spanning tree edges
+    print(f"\nSpanning tree analysis:")
+    print(f"  - Total edges in tree: {len(tree.edges)}")
+    
+    edge_weights = []
+    edge_directions = []
+    for u, v, data in tree.edges(data=True):
+        edge_weights.append(data['weight'])
+        edge_directions.append(data['direction'])
+    
+    if edge_weights:
+        edge_weights = np.array(edge_weights)
+        print(f"  - Edge weights (NCC + bonus): mean={edge_weights.mean():.4f}, min={edge_weights.min():.4f}, max={edge_weights.max():.4f}")
+        print(f"  - Directions in tree: left={edge_directions.count('left')}, top={edge_directions.count('top')}")
+        
+        # Show which tiles are connected
+        print(f"  - Connected tile pairs:")
+        for u, v, data in tree.edges(data=True):
+            weight = data['weight']
+            direction = data['direction']
+            # Extract the actual NCC (subtract bonus if present)
+            actual_ncc = weight - 10 if weight > 10 else weight
+            print(f"    Tile {u} -> {v} ({direction}): NCC={actual_ncc:.4f}, weight={weight:.4f}")
+    
+    print(f"=== END DEBUG REPORT ===\n")
     print("DEBUG: Spanning tree computation successful!")
     print(f"DEBUG: Tree has {len(tree.nodes)} nodes and {len(tree.edges)} edges")
     
     master_grid = compute_final_position(master_grid, tree)
+    
+    # ADDITIONAL DEBUG: Show final position changes
+    print(f"\nFinal position analysis:")
+    if 'x_pos' in master_grid.columns and 'y_pos' in master_grid.columns:
+        # Compare with original stage coordinates if available
+        if 'stage_x' in master_grid.columns and 'stage_y' in master_grid.columns:
+            x_shifts = master_grid['x_pos'] - master_grid['stage_x']
+            y_shifts = master_grid['y_pos'] - master_grid['stage_y']
+            
+            print(f"  - Position shifts from original stage coordinates:")
+            print(f"    X shifts: mean={x_shifts.mean():.1f}, std={x_shifts.std():.1f}, range=[{x_shifts.min():.1f}, {x_shifts.max():.1f}]")
+            print(f"    Y shifts: mean={y_shifts.mean():.1f}, std={y_shifts.std():.1f}, range=[{y_shifts.min():.1f}, {y_shifts.max():.1f}]")
+            
+            # Flag extreme movements
+            large_x_shifts = np.abs(x_shifts) > 1000  # More than 1000 pixels
+            large_y_shifts = np.abs(y_shifts) > 1000
+            if large_x_shifts.any() or large_y_shifts.any():
+                print(f"  ⚠️  WARNING: Large position shifts detected!")
+                print(f"    Tiles with large X shifts: {master_grid.index[large_x_shifts].tolist()}")
+                print(f"    Tiles with large Y shifts: {master_grid.index[large_y_shifts].tolist()}")
+        
+        # Show final positions
+        print(f"  - Final positions:")
+        print(f"    X range: [{master_grid['x_pos'].min():.1f}, {master_grid['x_pos'].max():.1f}]")
+        print(f"    Y range: [{master_grid['y_pos'].min():.1f}, {master_grid['y_pos'].max():.1f}]")
+    
+    print(f"=== REGISTRATION COMPLETE ===\n")
     
     prop_dict = {
         "W": full_sizeY,
@@ -1692,8 +1795,13 @@ def _compute_direction_translations(args):
         
         # interpret_translation works with edges and edge-based limits,
         # returns (ncc_val, y_best_edge_relative, x_best_edge_relative)
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation(
-            edge1, edge2, yins_edge, xins_edge, *lims_edge_relative[0], *lims_edge_relative[1]
+        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
+            edge1, edge2, yins_edge, xins_edge, *lims_edge_relative[0], *lims_edge_relative[1],
+            n=10,  # More candidates for RANSAC
+            ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
+            subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
+            use_continuous_optimization=True,
+            optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
         # Convert edge-relative translation back to global translation
