@@ -102,6 +102,8 @@ def set_tensor_backend(engine: Optional[str] = None) -> TensorBackend:
 DEFAULT_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_(?P<z_level>\d+)_", re.I)
 # Additional regex for multi-page TIFF files with "_stack" suffix
 MULTIPAGE_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)_stack", re.I)
+# Additional regex for OME-TIFF files (region_fov.ome.tif)
+OME_TIFF_FOV_RE = re.compile(r"(?P<region>\w+)_(?P<fov>0|[1-9]\d*)\.ome\.tiff?$", re.I)
 DEFAULT_FOV_COL = "fov"
 DEFAULT_X_COL = "x (mm)"
 DEFAULT_Y_COL = "y (mm)"
@@ -129,7 +131,7 @@ DEFAULT_Y_COL = "y (mm)"
 # but should be replaced with the proper abstraction in a future refactor.
 
 def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]]]:
-    """TEMPORARY HELPER: Parse FOV info from filename, handling both regular and multi-page TIFF formats.
+    """TEMPORARY HELPER: Parse FOV info from filename, handling regular, multi-page, and OME-TIFF formats.
     
     WARNING: This function duplicates regex logic and should be replaced with a proper
     FileFormat abstraction. See TODO comment above for the recommended approach.
@@ -144,7 +146,16 @@ def parse_filename_fov_info(filename: str) -> Optional[Dict[str, Union[str, int]
     Optional[Dict[str, Union[str, int]]]
         Dictionary with 'region', 'fov', and optionally 'z_level' keys, or None if no match
     """
-    # Try regular TIFF pattern first
+    # Try OME-TIFF pattern first (most specific)
+    m = OME_TIFF_FOV_RE.search(filename)
+    if m:
+        return {
+            'region': m.group('region'),
+            'fov': int(m.group('fov'))
+            # No z_level in OME-TIFF filenames - it's stored inside the file
+        }
+    
+    # Try regular TIFF pattern
     m = DEFAULT_FOV_RE.search(filename)
     if m:
         return {
@@ -438,7 +449,9 @@ def register_tiles_batched(
     pou: float = 3,
     ncc_threshold: float = 0.5,
     z_slice_to_keep: Optional[int] = 0,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    flatfield_manifest: Optional[Path] = None
 ) -> Tuple[pd.DataFrame, dict]:
     """Register tiles using memory-constrained batched processing.
     
@@ -460,6 +473,10 @@ def register_tiles_batched(
         Z-slice to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
+    flatfield_manifest : Optional[Path]
+        Path to flatfield manifest file to load corrections
         
     Returns
     -------
@@ -1374,10 +1391,12 @@ def read_tiff_images_for_region(
 ) -> Dict[str, np.ndarray]:
     """Read TIFF images from directory for a specific region.
     
+    Checks both the given directory and parent's ome_tiff/ subdirectory.
+    
     Parameters
     ----------
     directory : Union[str, Path]
-        Directory containing TIFF images
+        Directory containing TIFF images (typically a timepoint directory like '0/')
     pattern : str
         Glob pattern to match TIFF files
     region : str
@@ -1395,10 +1414,18 @@ def read_tiff_images_for_region(
     directory = Path(directory)
     images = {}
     
+    # Check for new OME-TIFF structure first
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        search_dir = parent_ome_dir
+        logger.info(f"Reading images from ome_tiff/ directory: {search_dir}")
+    else:
+        search_dir = directory
+    
     # Get all matching files
-    all_tiff_paths = list(directory.glob(pattern))
+    all_tiff_paths = list(search_dir.glob(pattern))
     if not all_tiff_paths:
-        print(f"No files matching pattern '{pattern}' found in {directory}")
+        print(f"No files matching pattern '{pattern}' found in {search_dir}")
         return images
     
     # Filter for the specific region
@@ -1422,12 +1449,21 @@ def read_tiff_images_for_region(
             if fov_info:
                 try:
                     fov = fov_info['fov']
-                    # For multi-page TIFFs, z_level is not in filename
-                    if 'z_level' in fov_info:
+                    
+                    # Check if this is an OME-TIFF or multi-page TIFF
+                    is_ome_tiff = path.name.lower().endswith('.ome.tif') or path.name.lower().endswith('.ome.tiff')
+                    is_multipage = '_stack' in path.name.lower()
+                    
+                    if is_ome_tiff or is_multipage:
+                        # For OME-TIFF and multi-page TIFF, z-selection happens during loading
+                        # Just use the target z_slice_to_keep as a placeholder
+                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
+                    elif 'z_level' in fov_info:
+                        # Regular TIFF with z_level in filename
                         z_level = fov_info['z_level']
                     else:
-                        # Multi-page TIFF: use z_slice_to_keep as the target z-level
-                        z_level = z_slice_to_keep if z_slice_to_keep is not None else 0
+                        # Shouldn't happen, but default to 0
+                        z_level = 0
                     
                     if fov not in fov_to_files_map:
                         fov_to_files_map[fov] = []
@@ -1481,16 +1517,50 @@ def read_tiff_images_for_region(
 
 
 
-def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
-    """Load a single image with error handling.
+def apply_flatfield_to_image(
+    image: np.ndarray, 
+    flatfield: np.ndarray, 
+    dtype: Optional[np.dtype] = None
+) -> np.ndarray:
+    """Apply flatfield correction to a single image.
     
-    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice
-    to match the default stitching behavior.
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image to correct
+    flatfield : np.ndarray
+        Flatfield correction array (same shape as image)
+    dtype : Optional[np.dtype]
+        Output dtype, defaults to input dtype
+        
+    Returns
+    -------
+    np.ndarray
+        Flatfield-corrected image
+    """
+    if dtype is None:
+        dtype = image.dtype
+    
+    corrected = (image / flatfield).clip(
+        min=np.iinfo(dtype).min if np.issubdtype(dtype, np.integer) else 0,
+        max=np.iinfo(dtype).max if np.issubdtype(dtype, np.integer) else 1
+    ).astype(dtype)
+    return corrected
+
+
+def load_single_image(path: Path, flatfield: Optional[np.ndarray] = None) -> Tuple[str, Optional[np.ndarray]]:
+    """Load a single image with error handling and optional flatfield correction.
+    
+    Handles regular TIFF, multi-page TIFF, and OME-TIFF files.
+    For multi-page TIFF files (containing "_stack" in name), extracts the middle z-slice.
+    For OME-TIFF files, extracts middle z-slice from first channel.
     
     Parameters
     ----------
     path : Path
         Path to the TIFF file
+    flatfield : Optional[np.ndarray]
+        Flatfield correction to apply (same shape as image)
         
     Returns
     -------
@@ -1498,8 +1568,29 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
         Tuple of (filename, image_array) or (filename, None) if loading failed
     """
     try:
+        image = None
+        
+        # Check if this is an OME-TIFF file
+        if path.name.lower().endswith('.ome.tif') or path.name.lower().endswith('.ome.tiff'):
+            # Use the image loader for OME-TIFF
+            try:
+                from ..image_loaders import create_image_loader
+                loader = create_image_loader(path, format_hint='ome_tiff')
+                meta = loader.metadata
+                
+                # Use first channel, middle z-slice for registration
+                channel_idx = 0
+                z_idx = meta['num_z'] // 2 if meta['num_z'] > 1 else 0
+                
+                image = loader.read_slice(channel=channel_idx, z=z_idx)
+                logger.debug(f"Loaded OME-TIFF {path.name}: channel {channel_idx}, z-slice {z_idx}/{meta['num_z']}")
+            except Exception as e:
+                logger.warning(f"Failed to load OME-TIFF with image_loaders, trying tifffile: {e}")
+                # Fallback to tifffile
+                pass
+        
         # Check if this is a multi-page TIFF
-        if "_stack" in path.name:
+        if image is None and "_stack" in path.name:
             # Multi-page TIFF: extract middle z-slice to match stitching behavior
             with tifffile.TiffFile(path) as tif:
                 num_pages = len(tif.pages)
@@ -1508,13 +1599,18 @@ def load_single_image(path: Path) -> Tuple[str, Optional[np.ndarray]]:
                     middle_z = num_pages // 2
                     image = tif.pages[middle_z].asarray()
                     logger.debug(f"Loaded middle z-slice {middle_z} from {path.name} ({num_pages} total slices)")
-                    return path.name, image
                 else:
                     # Single page, load normally
-                    return path.name, tif.pages[0].asarray()
-        else:
+                    image = tif.pages[0].asarray()
+        elif image is None:
             # Regular TIFF file
-            return path.name, tifffile.imread(str(path))
+            image = tifffile.imread(str(path))
+        
+        # Apply flatfield correction if provided
+        if image is not None and flatfield is not None:
+            image = apply_flatfield_to_image(image, flatfield, dtype=image.dtype)
+            
+        return path.name, image
     except MemoryError:
         logger.error(f"MemoryError reading {path}. File might be too large or corrupt.")
         return path.name, None
@@ -1644,6 +1740,8 @@ def update_stage_coordinates_multi_z(
 def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
     """Detect available channels in the directory.
     
+    Checks both the given directory and parent's ome_tiff/ subdirectory.
+    
     Parameters
     ----------
     directory : Union[str, Path]
@@ -1655,7 +1753,13 @@ def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
         Dictionary mapping channel type to list of file paths
     """
     directory = Path(directory)
-    tiff_files = list(directory.glob("*.tiff"))
+    
+    # Check for new OME-TIFF structure first
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        tiff_files = list(parent_ome_dir.glob("*.tiff")) + list(parent_ome_dir.glob("*.tif"))
+    else:
+        tiff_files = list(directory.glob("*.tiff")) + list(directory.glob("*.tif"))
     
     # Channel categories
     channels = {
@@ -1694,16 +1798,28 @@ def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
 def select_channel_pattern(directory: Union[str, Path]) -> str:
     """Automatically select an appropriate channel pattern.
     
+    Checks both the given directory and parent's ome_tiff/ subdirectory.
+    
     Parameters
     ----------
     directory : Union[str, Path]
-        Directory containing TIFF images
+        Directory containing TIFF images (typically a timepoint directory like '0/')
         
     Returns
     -------
     str
         Glob pattern for the selected channel
     """
+    directory = Path(directory)
+    
+    # Determine which directory to check for files
+    parent_ome_dir = directory.parent / "ome_tiff"
+    if parent_ome_dir.exists() and parent_ome_dir.is_dir():
+        search_dir = parent_ome_dir
+        logger.info(f"Detected ome_tiff/ directory, using {search_dir} for channel detection")
+    else:
+        search_dir = directory
+    
     channels = detect_channels(directory)
     
     # Prefer fluorescence channels if available
@@ -1740,7 +1856,19 @@ def select_channel_pattern(directory: Union[str, Path]) -> str:
         print(f"Selected brightfield channel: {pattern}")
         return pattern
     
-    # If no specific patterns found, use all TIFF files
+    # If no specific patterns found, check for OME-TIFF files first, then regular TIFF
+    # Check for OME-TIFF files (.ome.tif or .ome.tiff)
+    ome_tiff_files = [f for f in search_dir.iterdir() if f.suffix.lower() in ('.tif', '.tiff') and '.ome.' in f.name.lower()]
+    if ome_tiff_files:
+        # Check which extension is actually used (.tif vs .tiff)
+        example_file = ome_tiff_files[0].name
+        if example_file.lower().endswith('.ome.tiff'):
+            print("Info: Detected OME-TIFF files, using *.ome.tiff pattern")
+            return "*.ome.tiff"
+        else:
+            print("Info: Detected OME-TIFF files, using *.ome.tif pattern")
+            return "*.ome.tif"
+    
     print("Warning: No specific channel pattern detected, using all TIFF files")
     return "*.tiff"
 
@@ -1839,7 +1967,9 @@ def register_and_update_coordinates(
     skip_backup: bool = False,
     z_slice_for_registration: Optional[int] = 0,
     edge_width: int = DEFAULT_EDGE_WIDTH,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    flatfield_manifest: Optional[Path] = None
 ) -> pd.DataFrame:
     """Register tiles and update stage coordinates for all regions.
     
@@ -1867,6 +1997,10 @@ def register_and_update_coordinates(
         Width of the edge strips (in pixels) to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
+    flatfield_manifest : Optional[Path]
+        Path to flatfield manifest file to load corrections
         
     Returns
     -------
@@ -1962,12 +2096,18 @@ def register_and_update_coordinates(
         region_coords = coords_df[coords_df['region'] == region].copy()
         
         # Get image paths for this region only
-        # Look in the 0 subdirectory for TIFF files
-        tiff_dir = image_directory / "0"
-        if tiff_dir.exists():
-            selected_tiff_paths = list(tiff_dir.glob(channel_pattern))
+        # Check for new OME-TIFF structure first: ome_tiff/ directory
+        ome_tiff_dir = image_directory / "ome_tiff"
+        if ome_tiff_dir.exists() and ome_tiff_dir.is_dir():
+            selected_tiff_paths = list(ome_tiff_dir.glob(channel_pattern))
+            logger.info(f"Reading images from ome_tiff/ directory: {ome_tiff_dir}")
         else:
-            selected_tiff_paths = list(image_directory.glob(channel_pattern))
+            # Look in the 0 subdirectory for TIFF files (legacy structure)
+            tiff_dir = image_directory / "0"
+            if tiff_dir.exists():
+                selected_tiff_paths = list(tiff_dir.glob(channel_pattern))
+            else:
+                selected_tiff_paths = list(image_directory.glob(channel_pattern))
         
         # Filter for the specific region
         region_paths = []
@@ -2043,7 +2183,9 @@ def register_and_update_coordinates(
                 pou=pou,
                 ncc_threshold=ncc_threshold,
                 z_slice_to_keep=z_slice_for_registration,
-                tensor_backend_engine=tensor_backend_engine
+                tensor_backend_engine=tensor_backend_engine,
+                flatfield_corrections=flatfield_corrections,
+                flatfield_manifest=flatfield_manifest
             )
             
             # Calculate pixel size
@@ -2099,7 +2241,9 @@ def process_multiple_timepoints(
     pou: float = 3,
     ncc_threshold: float = 0.5,
     edge_width: int = DEFAULT_EDGE_WIDTH,
-    tensor_backend_engine: Optional[str] = None
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    flatfield_manifest: Optional[Path] = None
 ) -> Dict[int, pd.DataFrame]:
     """Process multiple timepoints from a directory.
     
@@ -2117,6 +2261,10 @@ def process_multiple_timepoints(
         Width of the edge strips (in pixels) to use for registration
     tensor_backend_engine : Optional[str]
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
+    flatfield_corrections : Optional[Dict[int, np.ndarray]]
+        Precomputed flatfield corrections indexed by channel
+    flatfield_manifest : Optional[Path]
+        Path to flatfield manifest file to load corrections
         
     Returns
     -------
@@ -2171,7 +2319,9 @@ def process_multiple_timepoints(
                 skip_backup=True,  # Skip backup since we already made one
                 z_slice_for_registration=0,
                 edge_width=edge_width,
-                tensor_backend_engine=tensor_backend_engine
+                tensor_backend_engine=tensor_backend_engine,
+                flatfield_corrections=flatfield_corrections,
+                flatfield_manifest=flatfield_manifest
             )
             results[timepoint] = updated_coords
             print(f"Successfully processed timepoint {timepoint}")
