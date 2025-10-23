@@ -348,6 +348,26 @@ def process_neighborhood_batch(
     
     return results
 
+def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2e5) -> bool:
+    """Check if edge strip is featureless (dust speckles only, no tissue).
+    
+    Checks only the edge region being registered, not the full tile.
+    This prevents false positives where a tile has tissue in center but empty edges.
+    
+    Args:
+        edge: 2D edge strip array (e.g., 2048x195)
+        variance_threshold: Variance threshold (default 2e5 for uint16 edges)
+        
+    Returns:
+        True if featureless (skip registration), False otherwise
+    """
+    # Downsample 16x for speed
+    downsampled = edge[::16, ::16]
+    if downsampled.size == 0:
+        return True  # Empty edge is featureless
+    variance = np.var(downsampled.astype(np.float32))
+    return variance < variance_threshold
+
 def compute_single_translation(
     image1_full: np.ndarray,
     image2_full: np.ndarray, 
@@ -375,6 +395,10 @@ def compute_single_translation(
         
         if edge1.size == 0 or edge2.size == 0:
             return None
+        
+        # Check if edge strips are featureless (dust only, no tissue)
+        if is_edge_featureless(edge1) or is_edge_featureless(edge2):
+            return None  # Skip registration, use stage coordinates only
             
         edge_sizeY, edge_sizeX = edge1.shape
         
@@ -554,10 +578,26 @@ def register_tiles_batched(
     if len(all_filenames) > 20:
         print(f"... (showing first 20 of {len(all_filenames)} total)")
     
-    # Initialize master grid with complete structure
+    # Initialize master grid with complete structure including stage coordinates
+    # Use existing filename_to_index mapping to get coordinates
+    stage_x_list = []
+    stage_y_list = []
+    
+    for filename in all_filenames:
+        coord_idx = filename_to_index.get(filename)
+        if coord_idx is not None and coord_idx in region_coords.index:
+            stage_x_list.append(float(region_coords.loc[coord_idx, 'x (mm)']))
+            stage_y_list.append(float(region_coords.loc[coord_idx, 'y (mm)']))
+        else:
+            # Fallback to 0,0 if no match (shouldn't happen)
+            stage_x_list.append(0.0)
+            stage_y_list.append(0.0)
+    
     master_grid = pd.DataFrame({
         "col": cols,
         "row": rows,
+        "stage_x": stage_x_list,
+        "stage_y": stage_y_list,
     }, index=np.arange(len(cols)))
     
     # DEBUG: Show grid occupancy matrix
@@ -904,10 +944,10 @@ def register_tiles_batched(
     print(f"  - Actual edge width used (top): {min(edge_width, full_sizeY)} ({100*min(edge_width, full_sizeY)/full_sizeY:.1f}% of image height)")
     
     if edge_width >= full_sizeX * 0.5:
-        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image width ({full_sizeX})")
+        print(f"  WARNING: edge_width ({edge_width}) is >=50% of image width ({full_sizeX})")
         print(f"     This may cause unstable registration as overlapping regions become too large!")
     if edge_width >= full_sizeY * 0.5:
-        print(f"  ⚠️  WARNING: edge_width ({edge_width}) is ≥50% of image height ({full_sizeY})")
+        print(f"  WARNING: edge_width ({edge_width}) is >=50% of image height ({full_sizeY})")
         print(f"     This may cause unstable registration as overlapping regions become too large!")
     
     tree = compute_maximum_spanning_tree(master_grid)
@@ -940,7 +980,22 @@ def register_tiles_batched(
     print("DEBUG: Spanning tree computation successful!")
     print(f"DEBUG: Tree has {len(tree.nodes)} nodes and {len(tree.edges)} edges")
     
-    master_grid = compute_final_position(master_grid, tree)
+    # Calculate pixel size from stage coordinates for isolated tile positioning
+    pixel_size_um = None
+    try:
+        # Quick estimate from first adjacent pair
+        for idx in range(len(master_grid) - 1):
+            left_idx = master_grid.loc[idx, 'left']
+            if pd.notna(left_idx):
+                dx_mm = abs(master_grid.loc[idx, 'stage_x'] - master_grid.loc[int(left_idx), 'stage_x'])
+                if dx_mm > 0:
+                    # Estimate from stage spacing (will be refined later)
+                    pixel_size_um = dx_mm * 1000.0 / 2084.0  # rough: mm * 1000 / image_width
+                    break
+    except:
+        pass
+    
+    master_grid = compute_final_position(master_grid, tree, pixel_size_um=pixel_size_um)
     
     # ADDITIONAL DEBUG: Show final position changes
     print(f"\nFinal position analysis:")
@@ -958,7 +1013,7 @@ def register_tiles_batched(
             large_x_shifts = np.abs(x_shifts) > 1000  # More than 1000 pixels
             large_y_shifts = np.abs(y_shifts) > 1000
             if large_x_shifts.any() or large_y_shifts.any():
-                print(f"  ⚠️  WARNING: Large position shifts detected!")
+                print(f"  WARNING: Large position shifts detected!")
                 print(f"    Tiles with large X shifts: {master_grid.index[large_x_shifts].tolist()}")
                 print(f"    Tiles with large Y shifts: {master_grid.index[large_y_shifts].tolist()}")
         
