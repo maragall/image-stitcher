@@ -11,6 +11,7 @@ translations between microscope image tiles. It includes:
 The module uses statistical methods to ensure robust registration results.
 """
 import itertools
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 from enum import Enum, auto
 import logging
@@ -132,6 +133,89 @@ def compute_image_overlap2(
         raise ValueError("Invalid overlap values > 100% detected")
         
     return tuple(overlap)
+
+@dataclass
+class FilterConfig:
+    """Configuration for translation filtering pipeline."""
+    overlap_left: Float
+    overlap_top: Float
+    size_x: Int
+    size_y: Int
+    pou: Float = 3.0
+    ncc_threshold: Float = 0.1
+    iqr_multiplier: Float = 1.5
+    repeatability: Float = 0.0
+
+
+def filter_translations(
+    grid: pd.DataFrame,
+    config: FilterConfig
+) -> pd.DataFrame:
+    """Unified translation filtering pipeline.
+    
+    Applies all filtering steps in sequence:
+    1. Filter by overlap and correlation (valid1)
+    2. Filter outliers using IQR (valid2)
+    3. Filter by repeatability (valid3)
+    4. Replace invalid translations with estimates
+    
+    Args:
+        grid: DataFrame with translation data
+        config: Filter configuration parameters
+        
+    Returns:
+        Filtered DataFrame with valid3 columns and second columns
+    """
+    # Check which directions have data
+    has_top = "top_y_first" in grid.columns or "top_y" in grid.columns
+    has_left = "left_x_first" in grid.columns or "left_x" in grid.columns
+    
+    # Apply overlap and correlation filter (valid1)
+    if has_top:
+        top_y_col = "top_y_first" if "top_y_first" in grid.columns else "top_y"
+        top_ncc_col = "top_ncc_first" if "top_ncc_first" in grid.columns else "top_ncc"
+        grid["top_valid1"] = filter_by_overlap_and_correlation(
+            grid[top_y_col], grid[top_ncc_col],
+            config.overlap_top, config.size_y, config.pou, config.ncc_threshold
+        )
+    else:
+        grid["top_valid1"] = pd.Series(False, index=grid.index)
+    
+    if has_left:
+        left_x_col = "left_x_first" if "left_x_first" in grid.columns else "left_x"
+        left_ncc_col = "left_ncc_first" if "left_ncc_first" in grid.columns else "left_ncc"
+        grid["left_valid1"] = filter_by_overlap_and_correlation(
+            grid[left_x_col], grid[left_ncc_col],
+            config.overlap_left, config.size_x, config.pou, config.ncc_threshold
+        )
+    else:
+        grid["left_valid1"] = pd.Series(False, index=grid.index)
+    
+    # Apply IQR outlier filter (valid2)
+    if has_top:
+        top_y_col = "top_y_first" if "top_y_first" in grid.columns else "top_y"
+        grid["top_valid2"] = filter_outliers(
+            grid[top_y_col], grid["top_valid1"], config.iqr_multiplier
+        )
+    else:
+        grid["top_valid2"] = pd.Series(False, index=grid.index)
+    
+    if has_left:
+        left_x_col = "left_x_first" if "left_x_first" in grid.columns else "left_x"
+        grid["left_valid2"] = filter_outliers(
+            grid[left_x_col], grid["left_valid1"], config.iqr_multiplier
+        )
+    else:
+        grid["left_valid2"] = pd.Series(False, index=grid.index)
+    
+    # Apply repeatability filter (valid3)
+    grid = filter_by_repeatability(grid, config.repeatability, config.ncc_threshold)
+    
+    # Replace invalid translations
+    grid = replace_invalid_translations(grid)
+    
+    return grid
+
 
 def filter_by_overlap_and_correlation(
     T: pd.Series,
