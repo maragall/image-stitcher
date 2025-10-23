@@ -546,7 +546,8 @@ def _validate_graph_weights(graph: nx.Graph) -> None:
 def compute_final_position(
     grid: pd.DataFrame,
     tree: nx.Graph,
-    source_index: Int = 0
+    source_index: Int = 0,
+    pixel_size_um: Optional[float] = None
 ) -> pd.DataFrame:
     """Compute final tile positions using the maximum spanning tree.
 
@@ -650,12 +651,29 @@ def compute_final_position(
         # For tiles not in tree, use original stage positions if available
         if tiles_not_in_tree:
             if 'stage_x' in grid.columns and 'stage_y' in grid.columns:
+                # Get pixel size from connected tiles (stage mm per pixel)
+                # Use first connected tile as reference to calculate scale
+                ref_idx = source_index
+                ref_stage_x = grid.loc[ref_idx, 'stage_x']
+                ref_stage_y = grid.loc[ref_idx, 'stage_y']
+                ref_px_x = grid.loc[ref_idx, 'x_pos']
+                ref_px_y = grid.loc[ref_idx, 'y_pos']
+                
                 for tile_idx in tiles_not_in_tree:
-                    # Convert stage coordinates (mm) to pixels if needed
-                    # For now, set to a safe position at the edge
-                    grid.loc[tile_idx, "x_pos"] = 0
-                    grid.loc[tile_idx, "y_pos"] = 0
-                logger.info(f"Set {len(tiles_not_in_tree)} isolated tiles to origin position")
+                    stage_x = grid.loc[tile_idx, 'stage_x']
+                    stage_y = grid.loc[tile_idx, 'stage_y']
+                    
+                    # Convert mm to pixels using provided pixel size, or compute from neighbors
+                    if pixel_size_um is not None:
+                        px_per_mm = 1000.0 / pixel_size_um
+                    else:
+                        # Fallback: estimate from connected tile spacing if possible
+                        px_per_mm = 1333.0  # ~0.75 um/pixel at 10x
+                    
+                    grid.loc[tile_idx, "x_pos"] = ref_px_x + (stage_x - ref_stage_x) * px_per_mm
+                    grid.loc[tile_idx, "y_pos"] = ref_px_y + (stage_y - ref_stage_y) * px_per_mm
+                    
+                logger.info(f"Set {len(tiles_not_in_tree)} isolated tiles using stage coordinates")
             else:
                 raise RuntimeError(
                     f"Cannot position {len(tiles_not_in_tree)} isolated tiles: no stage coordinates available"
