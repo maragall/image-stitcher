@@ -1,5 +1,6 @@
 import itertools
 import warnings
+from enum import Enum
 from typing import Tuple, Any, List, Optional, Callable
 from contextlib import contextmanager
 import time
@@ -29,6 +30,195 @@ from ._tensor_backend import TensorBackend, create_tensor_backend
 
 # Constants for memory management
 MAX_ARRAY_SIZE_GB = 2 # Maximum single array size in GB
+
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+class TranslationStrategy(Enum):
+    """Strategy for computing translation between image pairs."""
+    BASIC = "basic"           # Basic peak finding with NCC
+    SUBPIXEL = "subpixel"     # Subpixel phase correlation
+    OPTIMIZED = "optimized"   # Continuous optimization refinement
+    RANSAC = "ransac"         # RANSAC outlier rejection
+
+
+@dataclass
+class SubpixelConfig:
+    """Configuration for subpixel phase correlation refinement."""
+    upsample_factor: int = 100
+    use_subpixel: bool = True
+    reference_mask: Optional[np.ndarray] = None
+    moving_mask: Optional[np.ndarray] = None
+    overlap_ratio: float = 0.3
+    space: str = 'real'
+    normalization: str = 'phase'
+
+
+@dataclass
+class OptimizationConfig:
+    """Configuration for advanced optimization methods."""
+    method: str = 'trf'
+    max_nfev: int = 100
+    ftol: float = 1e-6
+    xtol: float = 1e-6
+    gtol: float = 1e-6
+    verbose: int = 0
+
+
+@dataclass
+class RANSACConfig:
+    """Configuration for RANSAC outlier rejection."""
+    use_ransac: bool = True
+    min_samples: int = 3
+    residual_threshold: float = 2.0
+    max_trials: int = 1000
+    stop_probability: float = 0.99
+    min_inlier_ratio: float = 0.3
+    transform_type: str = 'euclidean'
+    return_inlier_mask: bool = True
+
+
+@dataclass
+class _TranslationBounds:
+    """Encapsulates translation bounds for cleaner parameter passing."""
+    ymin: int
+    ymax: int
+    xmin: int
+    xmax: int
+    
+    def contains(self, y: int, x: int) -> bool:
+        """Check if translation (y, x) is within bounds."""
+        return (self.ymin <= y <= self.ymax) and (self.xmin <= x <= self.xmax)
+
+
+class _MagnitudeCalculator:
+    """Handles magnitude calculations with proper broadcasting."""
+    
+    def __init__(self, backend, size_y: int, size_x: int):
+        self.backend = backend
+        self.size_y = size_y
+        self.size_x = size_x
+        
+    def calculate_y_magnitudes(self, yins_backend) -> Tuple[Any, Any]:
+        """Calculate Y magnitudes with proper broadcasting."""
+        # Forward magnitudes: distance from top edge
+        ymags0 = yins_backend
+        
+        # Backward magnitudes: distance from bottom edge
+        # Create proper broadcast-compatible array using zeros + scalar addition
+        size_y_array = self.backend.zeros(yins_backend.shape, dtype=yins_backend.dtype) + self.size_y
+        ymags1 = size_y_array - yins_backend
+        
+        return ymags0, ymags1
+    
+    def calculate_x_magnitudes(self, xins_backend) -> Tuple[Any, Any]:
+        """Calculate X magnitudes with proper broadcasting."""
+        # Forward magnitudes: distance from left edge  
+        xmags0 = xins_backend
+        
+        # Backward magnitudes: distance from right edge
+        size_x_array = self.backend.zeros(xins_backend.shape, dtype=xins_backend.dtype) + self.size_x
+        xmags1 = size_x_array - xins_backend
+        
+        return xmags0, xmags1
+
+
+class _CandidateGenerator:
+    """Generates translation candidates efficiently."""
+    
+    def __init__(self, backend):
+        self.backend = backend
+        self.signs = [-1, +1]
+    
+    def generate_validity_mask(self, yins_backend, xins_backend, 
+                             mag_calc: _MagnitudeCalculator, 
+                             bounds: _TranslationBounds) -> Any:
+        """Generate boolean mask for valid translation candidates."""
+        # Pre-convert bounds to backend arrays (avoid repeated conversions)
+        bounds_arrays = self._convert_bounds_to_arrays(bounds, yins_backend)
+        
+        # Get magnitude arrays
+        ymags0, ymags1 = mag_calc.calculate_y_magnitudes(yins_backend)
+        xmags0, xmags1 = mag_calc.calculate_x_magnitudes(xins_backend)
+        
+        ymagss = [ymags0, ymags1]
+        xmagss = [xmags0, xmags1]
+        
+        # Initialize validity mask
+        valid_mask = self.backend.zeros(yins_backend.shape, dtype=bool)
+        
+        # Check all sign combinations
+        for ymags in ymagss:
+            for xmags in xmagss:
+                for ysign in self.signs:
+                    yvals = ymags * ysign
+                    for xsign in self.signs:
+                        xvals = xmags * xsign
+                        
+                        # Check bounds efficiently
+                        current_valid = (
+                            (bounds_arrays.ymin <= yvals) & (yvals <= bounds_arrays.ymax) &
+                            (bounds_arrays.xmin <= xvals) & (xvals <= bounds_arrays.xmax)
+                        )
+                        valid_mask = valid_mask | current_valid
+                        
+        return valid_mask
+    
+    def _convert_bounds_to_arrays(self, bounds: _TranslationBounds, reference_array) -> Any:
+        """Convert bounds to backend arrays for efficient comparison."""
+        @dataclass
+        class _BoundsArrays:
+            ymin: Any
+            ymax: Any  
+            xmin: Any
+            xmax: Any
+            
+        return _BoundsArrays(
+            ymin=self.backend.asarray(bounds.ymin),
+            ymax=self.backend.asarray(bounds.ymax),
+            xmin=self.backend.asarray(bounds.xmin),
+            xmax=self.backend.asarray(bounds.xmax)
+        )
+    
+    def generate_candidate_positions(self, yins_subset, xins_subset, 
+                                   mag_calc: _MagnitudeCalculator) -> np.ndarray:
+        """Generate candidate positions with correct array shapes."""
+        ymags0, ymags1 = mag_calc.calculate_y_magnitudes(yins_subset)
+        xmags0, xmags1 = mag_calc.calculate_x_magnitudes(xins_subset)
+        
+        ymagss = [ymags0, ymags1]
+        xmagss = [xmags0, xmags1]
+        
+        candidates = []
+        
+        for ymags in ymagss:
+            for xmags in xmagss:
+                for ysign in self.signs:
+                    yvals = ymags * ysign
+                    for xsign in self.signs:
+                        xvals = xmags * xsign
+                        # Convert to numpy for final processing
+                        y_np = self.backend.asnumpy(yvals)
+                        x_np = self.backend.asnumpy(xvals)
+                        candidates.append(np.column_stack([y_np, x_np]))
+        
+        if not candidates:
+            return np.empty((0, 2), dtype=np.int32)
+        
+        # Stack all candidates: shape will be (n_peaks, n_combinations * 2)
+        # where n_combinations = 16 (2*2*2*2)
+        all_candidates = np.concatenate(candidates, axis=1)
+        
+        # Reshape to (n_peaks, 16, 2) for iteration
+        n_peaks = all_candidates.shape[0]
+        return all_candidates.reshape(n_peaks, -1, 2)
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def get_tensor_backend() -> TensorBackend:
     """Get the global tensor backend instance from tile_registration module."""
@@ -217,36 +407,32 @@ def multi_peak_max(
             # Convert to backend array with explicit dtype for precision
             PCM_backend = backend.asarray(PCM, dtype=np.float64)
             
-            # Backend-agnostic flattening and sorting
-            # Create flattened view for consistent behavior across all backends
-            pcm_shape = PCM_backend.shape
-            pcm_flat = backend.asnumpy(PCM_backend).flatten()  # Flatten using numpy
-            pcm_flat_backend = backend.asarray(pcm_flat)       # Convert back to backend
-            flat_sorted_indices = backend.argsort(pcm_flat_backend)
+            # Use numpy for utilities (works with all array types)
+            pcm_np = backend.asnumpy(PCM_backend)
+            pcm_shape = pcm_np.shape
+            pcm_flat = pcm_np.flatten()
             
-            # Convert flat indices to 2D coordinates
-            row_backend, col_backend = backend.unravel_index(
-                flat_sorted_indices, PCM_backend.shape
-            )
+            # Numpy operations for sorting and indexing
+            flat_sorted_indices = np.argsort(pcm_flat)
+            row_np, col_np = np.unravel_index(flat_sorted_indices, pcm_shape)
             
             # Reverse to get largest peaks first (descending order)
-            row_rev_backend = backend.flip(row_backend, dims=[0])
-            col_rev_backend = backend.flip(col_backend, dims=[0])
+            # Make copies to avoid negative stride issues
+            row_rev_np = np.flip(row_np).copy().astype(np.int64)
+            col_rev_np = np.flip(col_np).copy().astype(np.int64)
 
-            # Extract peak values using advanced indexing
-            vals_backend = PCM_backend[row_rev_backend, col_rev_backend]
-            
-            # Apply peak limit if specified (memory efficient)
+            # Apply peak limit if specified (before indexing for efficiency)
             if max_peaks is not None and max_peaks > 0:
                 effective_max = min(max_peaks, PCM.size)
-                row_rev_backend = row_rev_backend[:effective_max]
-                col_rev_backend = col_rev_backend[:effective_max] 
-                vals_backend = vals_backend[:effective_max]
+                row_rev_np = row_rev_np[:effective_max]
+                col_rev_np = col_rev_np[:effective_max]
 
-            # Convert back to numpy with proper dtypes
-            rows_np = backend.asnumpy(row_rev_backend).astype(np.int64, copy=False)
-            cols_np = backend.asnumpy(col_rev_backend).astype(np.int64, copy=False)
-            vals_np = backend.asnumpy(vals_backend).astype(np.float64, copy=False)
+            # Extract peak values using numpy indexing (works with all array types)
+            pcm_array_for_indexing = backend.asnumpy(PCM_backend)
+            vals_np = pcm_array_for_indexing[row_rev_np, col_rev_np].astype(np.float64)
+            
+            rows_np = row_rev_np.astype(np.int64, copy=False)
+            cols_np = col_rev_np.astype(np.int64, copy=False)
             
             return rows_np, cols_np, vals_np
             
@@ -471,142 +657,6 @@ def extract_overlap_subregion(image: Any, y: Int, x: Int) -> Any:
     return image[ystart:yend, xstart:xend]
 
 
-@dataclass
-class _TranslationBounds:
-    """Encapsulates translation bounds for cleaner parameter passing."""
-    ymin: int
-    ymax: int
-    xmin: int
-    xmax: int
-    
-    def contains(self, y: int, x: int) -> bool:
-        """Check if translation (y, x) is within bounds."""
-        return (self.ymin <= y <= self.ymax) and (self.xmin <= x <= self.xmax)
-
-
-class _MagnitudeCalculator:
-    """Handles magnitude calculations with proper broadcasting."""
-    
-    def __init__(self, backend, size_y: int, size_x: int):
-        self.backend = backend
-        self.size_y = size_y
-        self.size_x = size_x
-        
-    def calculate_y_magnitudes(self, yins_backend) -> Tuple[Any, Any]:
-        """Calculate Y magnitudes with proper broadcasting."""
-        # Forward magnitudes: distance from top edge
-        ymags0 = yins_backend
-        
-        # Backward magnitudes: distance from bottom edge
-        # Create proper broadcast-compatible array using zeros + scalar addition
-        size_y_array = self.backend.zeros(yins_backend.shape, dtype=yins_backend.dtype) + self.size_y
-        ymags1 = size_y_array - yins_backend
-        
-        return ymags0, ymags1
-    
-    def calculate_x_magnitudes(self, xins_backend) -> Tuple[Any, Any]:
-        """Calculate X magnitudes with proper broadcasting."""
-        # Forward magnitudes: distance from left edge  
-        xmags0 = xins_backend
-        
-        # Backward magnitudes: distance from right edge
-        size_x_array = self.backend.zeros(xins_backend.shape, dtype=xins_backend.dtype) + self.size_x
-        xmags1 = size_x_array - xins_backend
-        
-        return xmags0, xmags1
-
-
-class _CandidateGenerator:
-    """Generates translation candidates efficiently."""
-    
-    def __init__(self, backend):
-        self.backend = backend
-        self.signs = [-1, +1]
-    
-    def generate_validity_mask(self, yins_backend, xins_backend, 
-                             mag_calc: _MagnitudeCalculator, 
-                             bounds: _TranslationBounds) -> Any:
-        """Generate boolean mask for valid translation candidates."""
-        # Pre-convert bounds to backend arrays (avoid repeated conversions)
-        bounds_arrays = self._convert_bounds_to_arrays(bounds, yins_backend)
-        
-        # Get magnitude arrays
-        ymags0, ymags1 = mag_calc.calculate_y_magnitudes(yins_backend)
-        xmags0, xmags1 = mag_calc.calculate_x_magnitudes(xins_backend)
-        
-        ymagss = [ymags0, ymags1]
-        xmagss = [xmags0, xmags1]
-        
-        # Initialize validity mask
-        valid_mask = self.backend.zeros(yins_backend.shape, dtype=bool)
-        
-        # Check all sign combinations
-        for ymags in ymagss:
-            for xmags in xmagss:
-                for ysign in self.signs:
-                    yvals = ymags * ysign
-                    for xsign in self.signs:
-                        xvals = xmags * xsign
-                        
-                        # Check bounds efficiently
-                        current_valid = (
-                            (bounds_arrays.ymin <= yvals) & (yvals <= bounds_arrays.ymax) &
-                            (bounds_arrays.xmin <= xvals) & (xvals <= bounds_arrays.xmax)
-                        )
-                        valid_mask = valid_mask | current_valid
-                        
-        return valid_mask
-    
-    def _convert_bounds_to_arrays(self, bounds: _TranslationBounds, reference_array) -> Any:
-        """Convert bounds to backend arrays for efficient comparison."""
-        @dataclass
-        class _BoundsArrays:
-            ymin: Any
-            ymax: Any  
-            xmin: Any
-            xmax: Any
-            
-        return _BoundsArrays(
-            ymin=self.backend.zeros(reference_array.shape, dtype=reference_array.dtype) + bounds.ymin,
-            ymax=self.backend.zeros(reference_array.shape, dtype=reference_array.dtype) + bounds.ymax,
-            xmin=self.backend.zeros(reference_array.shape, dtype=reference_array.dtype) + bounds.xmin,
-            xmax=self.backend.zeros(reference_array.shape, dtype=reference_array.dtype) + bounds.xmax
-        )
-    
-    def generate_candidate_positions(self, yins_subset, xins_subset, 
-                                   mag_calc: _MagnitudeCalculator) -> np.ndarray:
-        """Generate candidate positions with correct array shapes."""
-        ymags0, ymags1 = mag_calc.calculate_y_magnitudes(yins_subset)
-        xmags0, xmags1 = mag_calc.calculate_x_magnitudes(xins_subset)
-        
-        ymagss = [ymags0, ymags1]
-        xmagss = [xmags0, xmags1]
-        
-        candidates = []
-        
-        for ymags in ymagss:
-            for xmags in xmagss:
-                for ysign in self.signs:
-                    yvals = ymags * ysign
-                    for xsign in self.signs:
-                        xvals = xmags * xsign
-                        # Convert to numpy for final processing
-                        y_np = self.backend.asnumpy(yvals)
-                        x_np = self.backend.asnumpy(xvals)
-                        candidates.append(np.column_stack([y_np, x_np]))
-        
-        if not candidates:
-            return np.empty((0, 2), dtype=np.int32)
-        
-        # Stack all candidates: shape will be (n_peaks, n_combinations * 2)
-        # where n_combinations = 16 (2*2*2*2)
-        all_candidates = np.concatenate(candidates, axis=1)
-        
-        # Reshape to (n_peaks, 16, 2) for iteration
-        n_peaks = all_candidates.shape[0]
-        return all_candidates.reshape(n_peaks, -1, 2)
-
-
 def interpret_translation(
     image1: NumArray,
     image2: npt.NDArray,
@@ -677,8 +727,9 @@ def interpret_translation(
         yins_backend, xins_backend, mag_calc, bounds
     )
 
-    # Check if any peaks are valid
-    if not backend.any(valid_mask):
+    # Check if any peaks are valid (use numpy for utility)
+    valid_mask_np = backend.asnumpy(valid_mask)
+    if not np.any(valid_mask_np):
         return -float('inf'), 0, 0
 
     # Select top n valid peaks
@@ -743,17 +794,83 @@ def interpret_translation(
     return best_ncc, best_y, best_x
 
 
-@dataclass
-class RANSACConfig:
-    """Configuration for RANSAC outlier rejection."""
-    use_ransac: bool = True                    # Enable RANSAC outlier rejection
-    min_samples: int = 3                       # Minimum samples to fit model (3 optimal for 2D translation)
-    residual_threshold: float = 2.0            # Maximum residual for inliers (1.5-3.0 pixels optimal range)
-    max_trials: int = 1000                     # Maximum RANSAC iterations (1000 is industry standard)
-    stop_probability: float = 0.99             # Probability of finding good model (0.99 standard confidence)
-    min_inlier_ratio: float = 0.3             # Minimum ratio of inliers required (30% well-established)
-    transform_type: str = 'euclidean'          # 'euclidean' or 'affine' transformation
-    return_inlier_mask: bool = True            # Return mask of inlier points
+def compute_translation(
+    image1: NumArray,
+    image2: npt.NDArray,
+    yins: IntArray,
+    xins: IntArray,
+    ymin: Int,
+    ymax: Int,
+    xmin: Int,
+    xmax: Int,
+    strategy: TranslationStrategy = TranslationStrategy.BASIC,
+    n: Int = 10,
+    subpixel_config: Optional['SubpixelConfig'] = None,
+    ransac_config: Optional['RANSACConfig'] = None,
+    optimization_config: Optional['OptimizationConfig'] = None,
+) -> Tuple[float, float, float]:
+    """Unified translation computation with configurable strategy.
+    
+    Args:
+        image1: First image array
+        image2: Second image array
+        yins: Y coordinates of peaks from PCM
+        xins: X coordinates of peaks from PCM
+        ymin: Minimum Y translation bound
+        ymax: Maximum Y translation bound
+        xmin: Minimum X translation bound
+        xmax: Maximum X translation bound
+        strategy: Translation computation strategy
+        n: Maximum number of peaks to evaluate
+        subpixel_config: Configuration for subpixel phase correlation
+        ransac_config: Configuration for RANSAC outlier rejection
+        optimization_config: Configuration for continuous optimization
+        
+    Returns:
+        Tuple of (best_ncc, best_y_translation, best_x_translation)
+    """
+    # Initialize configs
+    if subpixel_config is None:
+        subpixel_config = SubpixelConfig()
+    if ransac_config is None:
+        ransac_config = RANSACConfig()
+    if optimization_config is None:
+        optimization_config = OptimizationConfig()
+    
+    if strategy == TranslationStrategy.BASIC:
+        return interpret_translation(
+            image1, image2, yins, xins, ymin, ymax, xmin, xmax, min(n, 2)
+        )
+    
+    elif strategy == TranslationStrategy.SUBPIXEL:
+        return interpret_translation_subpixel(
+            image1, image2, yins, xins, ymin, ymax, xmin, xmax,
+            n=min(n, 2),
+            subpixel_config=subpixel_config,
+            use_continuous_optimization=False,
+            optimization_config=optimization_config
+        )
+    
+    elif strategy == TranslationStrategy.OPTIMIZED:
+        return interpret_translation_optimized(
+            image1, image2, yins, xins, ymin, ymax, xmin, xmax,
+            n=min(n, 2),
+            use_continuous_optimization=True,
+            optimization_config=optimization_config
+        )
+    
+    elif strategy == TranslationStrategy.RANSAC:
+        return interpret_translation_ransac(
+            image1, image2, yins, xins, ymin, ymax, xmin, xmax,
+            n=n,
+            ransac_config=ransac_config,
+            subpixel_config=subpixel_config,
+            use_continuous_optimization=True,
+            optimization_config=optimization_config
+        )
+    
+    else:
+        raise ValueError(f"Unknown translation strategy: {strategy}")
 
 
 def generate_translation_candidates(
@@ -1038,7 +1155,9 @@ def interpret_translation_ransac(
     use_continuous_optimization: bool = True,
     optimization_config: Optional['OptimizationConfig'] = None
 ) -> Tuple[float, float, float]:
-    """Ultimate translation interpretation with RANSAC outlier rejection.
+    """[DEPRECATED] Use compute_translation(strategy=TranslationStrategy.RANSAC) instead.
+    
+    Ultimate translation interpretation with RANSAC outlier rejection.
     
     This function combines all three methods with RANSAC for maximum robustness:
     1. Generate multiple translation candidates from PCM peaks
@@ -1113,9 +1232,26 @@ def interpret_translation_ransac(
     # Method 2: Direct subpixel phase correlation
     if subpixel_config.use_subpixel and SKIMAGE_AVAILABLE:
         try:
-            _, (subpixel_y, subpixel_x), correlation_error = pcm_subpixel(
-                image1, image2, subpixel_config
+            # Use scikit-image's phase correlation directly
+            img1_np = np.asarray(image1, dtype=np.float64)
+            img2_np = np.asarray(image2, dtype=np.float64)
+            
+            result = phase_cross_correlation(
+                img1_np, img2_np,
+                upsample_factor=subpixel_config.upsample_factor,
+                reference_mask=subpixel_config.reference_mask,
+                moving_mask=subpixel_config.moving_mask,
+                overlap_ratio=subpixel_config.overlap_ratio,
+                space=subpixel_config.space,
+                normalization=subpixel_config.normalization
             )
+            
+            # Extract shift from result (handle different scikit-image versions)
+            if len(result) >= 2:
+                shift = result[0]
+            else:
+                shift = result
+            subpixel_y, subpixel_x = float(shift[0]), float(shift[1])
             
             # Check if subpixel result is within bounds
             if (ymin <= subpixel_y <= ymax and xmin <= subpixel_x <= xmax):
@@ -1184,99 +1320,6 @@ def interpret_translation_ransac(
     return best_ncc, best_y, best_x
 
 
-@dataclass
-class SubpixelConfig:
-    """Configuration for subpixel phase correlation refinement."""
-    upsample_factor: int = 100  # Subpixel precision factor (50-200 optimal, 100 = 0.01 pixel accuracy)
-    use_subpixel: bool = True   # Enable subpixel refinement
-    reference_mask: Optional[np.ndarray] = None  # Optional mask for reference image
-    moving_mask: Optional[np.ndarray] = None     # Optional mask for moving image
-    overlap_ratio: float = 0.3  # Minimum overlap ratio (0.3 is scikit-image default, optimal)
-    space: str = 'real'         # 'real' or 'fourier' space ('real' standard for registration)
-    normalization: str = 'phase'  # 'phase' or None ('phase' is gold standard normalization)
-
-
-def pcm_subpixel(
-    image1: NumArray, 
-    image2: NumArray,
-    config: SubpixelConfig = SubpixelConfig()
-) -> Tuple[FloatArray, Tuple[float, float], float]:
-    """Compute phase correlation matrix with subpixel refinement.
-    
-    Uses scikit-image's phase_cross_correlation for Foroosh-Hassan-Brown subpixel
-    accuracy. Falls back to standard PCM if scikit-image is unavailable.
-    
-    Args:
-        image1: First image (2D array)
-        image2: Second image (2D array, same size as image1)
-        config: Subpixel configuration parameters
-        
-    Returns:
-        Tuple of (PCM_matrix, (subpixel_y_shift, subpixel_x_shift), correlation_error)
-        - PCM_matrix: Phase correlation matrix (for compatibility with existing code)
-        - subpixel_shift: Sub-pixel accurate translation (y, x)
-        - correlation_error: Correlation quality metric (lower is better)
-        
-    Raises:
-        ValueError: If images are invalid or incompatible
-        RuntimeError: If computation fails
-    """
-    validate_image_pair(image1, image2)
-    
-    # Convert to numpy arrays for scikit-image compatibility
-    img1_np = np.asarray(image1, dtype=np.float64)
-    img2_np = np.asarray(image2, dtype=np.float64)
-    
-    if not config.use_subpixel or not SKIMAGE_AVAILABLE:
-        # Fallback to standard PCM
-        pcm_result = pcm(image1, image2)
-        # Return dummy subpixel shift (will be computed by peak finding)
-        return pcm_result, (0.0, 0.0), 1.0
-    
-    with managed_memory():
-        try:
-            # Use scikit-image's phase correlation with subpixel refinement
-            result = phase_cross_correlation(
-                img1_np, 
-                img2_np,
-                upsample_factor=config.upsample_factor,
-                reference_mask=config.reference_mask,
-                moving_mask=config.moving_mask,
-                overlap_ratio=config.overlap_ratio,
-                space=config.space,
-                normalization=config.normalization
-            )
-            
-            # Handle different return formats based on scikit-image version
-            if len(result) == 3:
-                # Standard format: (shift, error, phasediff)
-                shift, error, phasediff = result
-                correlation_error = float(error)
-            elif len(result) == 2:
-                # Some versions: (shift, second_value)
-                shift, second_value = result
-                correlation_error = 0.0  # Default if error not available
-            else:
-                # Older versions: just shift
-                shift = result
-                correlation_error = 0.0
-            
-            # shift is (row_shift, col_shift) = (y_shift, x_shift)
-            subpixel_y, subpixel_x = float(shift[0]), float(shift[1])
-            
-            # For compatibility, also compute the PCM matrix
-            # This allows existing peak-finding code to work unchanged
-            pcm_result = pcm(image1, image2)
-            
-            return pcm_result, (subpixel_y, subpixel_x), correlation_error
-            
-        except Exception as e:
-            # Fallback to standard PCM on any error
-            warnings.warn(f"Subpixel phase correlation failed, using standard PCM: {e}")
-            pcm_result = pcm(image1, image2)
-            return pcm_result, (0.0, 0.0), 1.0
-
-
 def interpret_translation_subpixel(
     image1: NumArray,
     image2: npt.NDArray,
@@ -1291,7 +1334,9 @@ def interpret_translation_subpixel(
     use_continuous_optimization: bool = True,
     optimization_config: Optional['OptimizationConfig'] = None
 ) -> Tuple[float, float, float]:
-    """Enhanced translation interpretation with subpixel phase correlation.
+    """[DEPRECATED] Use compute_translation(strategy=TranslationStrategy.SUBPIXEL) instead.
+    
+    Enhanced translation interpretation with subpixel phase correlation.
     
     This function combines subpixel phase correlation with the existing
     discrete peak finding and optional continuous optimization for maximum accuracy.
@@ -1330,9 +1375,26 @@ def interpret_translation_subpixel(
     # Method 1: Direct subpixel phase correlation
     if subpixel_config.use_subpixel and SKIMAGE_AVAILABLE:
         try:
-            _, (subpixel_y, subpixel_x), correlation_error = pcm_subpixel(
-                image1, image2, subpixel_config
+            # Use scikit-image's phase correlation directly
+            img1_np = np.asarray(image1, dtype=np.float64)
+            img2_np = np.asarray(image2, dtype=np.float64)
+            
+            result = phase_cross_correlation(
+                img1_np, img2_np,
+                upsample_factor=subpixel_config.upsample_factor,
+                reference_mask=subpixel_config.reference_mask,
+                moving_mask=subpixel_config.moving_mask,
+                overlap_ratio=subpixel_config.overlap_ratio,
+                space=subpixel_config.space,
+                normalization=subpixel_config.normalization
             )
+            
+            # Extract shift from result (handle different scikit-image versions)
+            if len(result) >= 2:
+                shift = result[0]
+            else:
+                shift = result
+            subpixel_y, subpixel_x = float(shift[0]), float(shift[1])
             
             # Check if subpixel result is within bounds
             if (ymin <= subpixel_y <= ymax and xmin <= subpixel_x <= xmax):
@@ -1401,92 +1463,6 @@ def interpret_translation_subpixel(
     return best_ncc, best_y, best_x
 
 
-@dataclass
-class OptimizationConfig:
-    """Configuration for advanced optimization methods."""
-    method: str = 'trf'  # 'trf' for Trust Region (supports bounds), 'lm' for Levenberg-Marquardt (no bounds)
-    max_nfev: int = 100  # Maximum function evaluations (50-200 optimal range)
-    ftol: float = 1e-6   # Function tolerance (1e-6 optimal for numerical stability)
-    xtol: float = 1e-6   # Parameter tolerance (1e-6 optimal for practical convergence)
-    gtol: float = 1e-6   # Gradient tolerance (1e-6 optimal for gradient-based methods)
-    verbose: int = 0     # Verbosity level (0=silent, 1=progress, 2=detailed)
-
-
-def _ncc_objective_function(
-    params: np.ndarray,
-    image1_backend: Any,
-    image2_backend: Any,
-    backend: TensorBackend
-) -> float:
-    """Objective function for optimization: returns negative NCC for minimization.
-    
-    Args:
-        params: [y_translation, x_translation] as continuous values
-        image1_backend: First image (backend array)
-        image2_backend: Second image (backend array)
-        backend: Tensor backend instance
-        
-    Returns:
-        Negative NCC value (for minimization)
-    """
-    y_trans, x_trans = params
-    
-    # Round to nearest integers for overlap extraction
-    y_int, x_int = int(np.round(y_trans)), int(np.round(x_trans))
-    
-    try:
-        # Extract overlapping regions
-        subI1 = extract_overlap_subregion(image1_backend, y_int, x_int)
-        subI2 = extract_overlap_subregion(image2_backend, -y_int, -x_int)
-        
-        # Check for empty overlaps
-        if (hasattr(subI1, 'shape') and np.prod(subI1.shape) == 0) or \
-           (hasattr(subI2, 'shape') and np.prod(subI2.shape) == 0):
-            return 1.0  # Worst possible NCC (return positive for minimization)
-        
-        # Compute NCC
-        ncc_val = ncc(subI1, subI2)
-        
-        # Handle invalid NCC values
-        if np.isnan(ncc_val) or np.isinf(ncc_val):
-            return 1.0  # Worst possible NCC
-            
-        # Return negative NCC for minimization (scipy minimizes)
-        return -ncc_val
-        
-    except Exception:
-        return 1.0  # Return worst case on any error
-
-
-def _ncc_residual_function(
-    params: np.ndarray,
-    image1_backend: Any,
-    image2_backend: Any,
-    backend: TensorBackend
-) -> np.ndarray:
-    """Residual function for least squares: returns vector of residuals.
-    
-    For translation estimation, we create a simple residual based on NCC.
-    This allows Levenberg-Marquardt to work with the gradient information.
-    
-    Args:
-        params: [y_translation, x_translation] as continuous values
-        image1_backend: First image (backend array)
-        image2_backend: Second image (backend array)
-        backend: Tensor backend instance
-        
-    Returns:
-        Array of residuals (single element: sqrt(1 - NCC))
-    """
-    ncc_negative = _ncc_objective_function(params, image1_backend, image2_backend, backend)
-    ncc_val = -ncc_negative
-    
-    # Convert NCC to residual: sqrt(1 - NCC) for better numerical properties
-    residual = np.sqrt(np.maximum(0.0, 1.0 - ncc_val))
-    
-    return np.array([residual])
-
-
 def optimize_translation_continuous(
     image1: NumArray,
     image2: NumArray,
@@ -1546,11 +1522,29 @@ def optimize_translation_continuous(
         if not (ymin <= initial_y <= ymax and xmin <= initial_x <= xmax):
             warnings.warn("Levenberg-Marquardt method doesn't support bounds. Initial values should be well within valid range.")
     
+    # Inline residual function for least_squares
+    def residual_fn(params: np.ndarray) -> np.ndarray:
+        """Compute residual: sqrt(1 - NCC) for optimization."""
+        y_trans, x_trans = params
+        y_int, x_int = int(np.round(y_trans)), int(np.round(x_trans))
+        try:
+            subI1 = extract_overlap_subregion(image1_backend, y_int, x_int)
+            subI2 = extract_overlap_subregion(image2_backend, -y_int, -x_int)
+            if (hasattr(subI1, 'shape') and np.prod(subI1.shape) == 0) or \
+               (hasattr(subI2, 'shape') and np.prod(subI2.shape) == 0):
+                return np.array([1.0])  # Worst residual
+            ncc_val = ncc(subI1, subI2)
+            if np.isnan(ncc_val) or np.isinf(ncc_val):
+                return np.array([1.0])
+            return np.array([np.sqrt(np.maximum(0.0, 1.0 - ncc_val))])
+        except Exception:
+            return np.array([1.0])
+    
     with managed_memory():
         try:
             # Run optimization
             result = least_squares(
-                fun=_ncc_residual_function,
+                fun=residual_fn,
                 x0=x0,
                 bounds=bounds,
                 method=config.method,
@@ -1558,8 +1552,7 @@ def optimize_translation_continuous(
                 ftol=config.ftol,
                 xtol=config.xtol,
                 gtol=config.gtol,
-                verbose=config.verbose,
-                args=(image1_backend, image2_backend, backend)
+                verbose=config.verbose
             )
             
             # Extract optimized parameters
@@ -1573,9 +1566,17 @@ def optimize_translation_continuous(
                     opt_x = np.clip(opt_x, xmin, xmax)
                     warnings.warn(f"Optimization result clamped to bounds: ({opt_y:.3f}, {opt_x:.3f})")
             
-            # Compute final NCC at optimized position
-            final_params = np.array([opt_y, opt_x])
-            final_ncc = -_ncc_objective_function(final_params, image1_backend, image2_backend, backend)
+            # Compute final NCC at optimized position (inline objective function)
+            y_int, x_int = int(np.round(opt_y)), int(np.round(opt_x))
+            subI1 = extract_overlap_subregion(image1_backend, y_int, x_int)
+            subI2 = extract_overlap_subregion(image2_backend, -y_int, -x_int)
+            if (hasattr(subI1, 'shape') and np.prod(subI1.shape) == 0) or \
+               (hasattr(subI2, 'shape') and np.prod(subI2.shape) == 0):
+                final_ncc = 0.0
+            else:
+                final_ncc = ncc(subI1, subI2)
+                if np.isnan(final_ncc) or np.isinf(final_ncc):
+                    final_ncc = 0.0
             
             # Validate result
             if not result.success:
@@ -1600,7 +1601,9 @@ def interpret_translation_optimized(
     use_continuous_optimization: bool = True,
     optimization_config: OptimizationConfig = OptimizationConfig()
 ) -> Tuple[float, float, float]:
-    """Enhanced translation interpretation with optional continuous optimization.
+    """[DEPRECATED] Use compute_translation(strategy=TranslationStrategy.OPTIMIZED) instead.
+    
+    Enhanced translation interpretation with optional continuous optimization.
     
     This function extends the original interpret_translation with advanced
     optimization capabilities. It first uses the discrete grid search to find
