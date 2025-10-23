@@ -26,6 +26,7 @@ that replaces the previous broken register_tiles function.
 """
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import re
 import logging
@@ -34,7 +35,7 @@ import multiprocessing as mp
 import json
 import gc
 import psutil
-from typing import Dict, List, Optional, Tuple, Union, Pattern, Iterator, Set
+from typing import Dict, List, Optional, Tuple, Union, Pattern, Set
 from ._typing_utils import BoolArray
 from ._typing_utils import Float
 from ._typing_utils import NumArray
@@ -48,13 +49,10 @@ from ._constrained_refinement import refine_translations
 from ._global_optimization import compute_final_position
 from ._global_optimization import compute_maximum_spanning_tree
 from ._stage_model import compute_image_overlap2
-from ._stage_model import filter_by_overlap_and_correlation
-from ._stage_model import filter_by_repeatability
-from ._stage_model import filter_outliers
-from ._stage_model import replace_invalid_translations
-from ._translation_computation import interpret_translation, interpret_translation_optimized, interpret_translation_subpixel, interpret_translation_ransac
+from ._stage_model import filter_translations, FilterConfig
+from ._translation_computation import compute_translation, TranslationStrategy
 from ._translation_computation import multi_peak_max
-from ._translation_computation import pcm, pcm_subpixel
+from ._translation_computation import pcm
 from ._translation_computation import OptimizationConfig, SubpixelConfig, RANSACConfig
 from ._tensor_backend import TensorBackend, create_tensor_backend
 
@@ -182,6 +180,18 @@ ROW_TOL_FACTOR = 0.20  # Tolerance factor for row clustering
 COL_TOL_FACTOR = 0.20  # Tolerance factor for column clustering
 DEFAULT_EDGE_WIDTH = 256  # Increased from 64 to 256 for better correlation with 2048x2048 tiles
 
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+class RegistrationMode(Enum):
+    """Mode for tile registration operations."""
+    SINGLE = "single"
+    AUTO = "auto"
+    MULTI_TIMEPOINT = "multi"
+
+
 @dataclass
 class Neighborhood:
     """A tile and its required neighbors for translation computation."""
@@ -197,6 +207,23 @@ class Neighborhood:
         if self.top_idx is not None:
             indices.add(self.top_idx)
         return indices
+
+
+@dataclass
+class RowInfo:
+    """Information about a row of tiles.
+    
+    Attributes:
+        center_y: Y-coordinate of the row center in mm
+        tile_indices: List of indices for tiles in this row
+    """
+    center_y: float
+    tile_indices: List[int]
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def create_neighborhoods(master_grid: pd.DataFrame) -> List[Neighborhood]:
     """Create neighborhoods for all tiles that need translation computation."""
@@ -408,14 +435,14 @@ def compute_single_translation(
         
         yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
         
-        # interpret_translation with RANSAC + subpixel + optimization (ultimate method)
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
+        # Compute translation with RANSAC strategy (includes subpixel + optimization)
+        ncc_val, y_best_edge_relative, x_best_edge_relative = compute_translation(
             edge1, edge2, yins_edge, xins_edge, 
             *lims_edge_relative[0], *lims_edge_relative[1],
-            n=10,  # More candidates for RANSAC
+            strategy=TranslationStrategy.RANSAC,
+            n=10,
             ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
             subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
-            use_continuous_optimization=True,
             optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
@@ -448,13 +475,9 @@ def calculate_safe_batch_size(first_image_path: Path, memory_fraction: float = 0
     
     return max_batch_size
 
-def batch_paths(paths: List[Path], batch_size: int) -> Iterator[List[Path]]:
-    """Split paths into batches of specified size."""
-    for i in range(0, len(paths), batch_size):
-        yield paths[i:i + batch_size]
 
-def _load_image_wrapper(path: Path) -> Tuple[str, Optional[np.ndarray]]:
-    """Wrapper for multiprocessing - no flatfield during parallel load."""
+def _load_image_no_flatfield(path: Path) -> Tuple[str, Optional[np.ndarray]]:
+    """Load image without flatfield correction (for multiprocessing)."""
     return load_single_image(path, flatfield=None)
 
 def load_batch_images(
@@ -464,9 +487,10 @@ def load_batch_images(
     """Load a batch of images using multiprocessing, apply flatfield serially."""
     n_processes = min(cpu_count(), len(batch_paths))
     
+    # Load images in parallel without flatfield
     with Pool(processes=n_processes) as pool:
         results = list(tqdm(
-            pool.imap(_load_image_wrapper, batch_paths),
+            pool.imap(_load_image_no_flatfield, batch_paths),
             total=len(batch_paths),
             desc="Loading batch"
         ))
@@ -492,7 +516,9 @@ def register_tiles_batched(
     flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
     registration_channel: int = 0
 ) -> Tuple[pd.DataFrame, dict]:
-    """Register tiles using memory-constrained batched processing.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.SINGLE) instead.
+    
+    Register tiles using memory-constrained batched processing.
     
     Parameters
     ----------
@@ -832,32 +858,28 @@ def register_tiles_batched(
     else:
         overlap_top = 50.0
     
-    # Apply filtering (existing logic)
-    if has_top_pairs:
-        master_grid["top_valid1"] = filter_by_overlap_and_correlation(
-            master_grid["top_y_first"], master_grid["top_ncc_first"], 
-            overlap_top, full_sizeY, pou, ncc_threshold
-        )
-        master_grid["top_valid2"] = filter_outliers(master_grid["top_y_first"], master_grid["top_valid1"])
-    else:
-        master_grid["top_valid1"] = pd.Series(False, index=master_grid.index)
-        master_grid["top_valid2"] = pd.Series(False, index=master_grid.index)
-    
-    if has_left_pairs:
-        master_grid["left_valid1"] = filter_by_overlap_and_correlation(
-            master_grid["left_x_first"], master_grid["left_ncc_first"], 
-            overlap_left, full_sizeX, pou, ncc_threshold
-        )
-        master_grid["left_valid2"] = filter_outliers(master_grid["left_x_first"], master_grid["left_valid1"])
-    else:
-        master_grid["left_valid1"] = pd.Series(False, index=master_grid.index)
-        master_grid["left_valid2"] = pd.Series(False, index=master_grid.index)
-    
-    # Compute repeatability and apply remaining filters
+    # Compute repeatability (needed for filter config)
     rs = []
     for direction, dims_chars, rowcol_group_key in zip(["top", "left"], ["yx", "xy"], ["col", "row"]):
-        valid_key = f"{direction}_valid2"
-        valid_grid_subset = master_grid[master_grid[valid_key].fillna(False)]
+        # Calculate valid translations for repeatability computation
+        if direction == "top" and has_top_pairs:
+            temp_valid = (
+                master_grid["top_y_first"].between(
+                    full_sizeY * (100 - overlap_top - pou) / 100,
+                    full_sizeY * (100 - overlap_top + pou) / 100
+                ) & (master_grid["top_ncc_first"] > ncc_threshold)
+            )
+            valid_grid_subset = master_grid[temp_valid.fillna(False)]
+        elif direction == "left" and has_left_pairs:
+            temp_valid = (
+                master_grid["left_x_first"].between(
+                    full_sizeX * (100 - overlap_left - pou) / 100,
+                    full_sizeX * (100 - overlap_left + pou) / 100
+                ) & (master_grid["left_ncc_first"] > ncc_threshold)
+            )
+            valid_grid_subset = master_grid[temp_valid.fillna(False)]
+        else:
+            valid_grid_subset = pd.DataFrame()
         
         if len(valid_grid_subset) > 0:
             w1s = valid_grid_subset[f"{direction}_{dims_chars[0]}_first"]
@@ -875,8 +897,18 @@ def register_tiles_batched(
     
     r_repeatability = np.max(rs) if rs else 0
     
-    master_grid = filter_by_repeatability(master_grid, r_repeatability, ncc_threshold)
-    master_grid = replace_invalid_translations(master_grid)
+    # Apply unified filtering pipeline
+    filter_config = FilterConfig(
+        overlap_left=overlap_left,
+        overlap_top=overlap_top,
+        size_x=full_sizeX,
+        size_y=full_sizeY,
+        pou=pou,
+        ncc_threshold=ncc_threshold,
+        iqr_multiplier=1.5,
+        repeatability=r_repeatability
+    )
+    master_grid = filter_translations(master_grid, filter_config)
     
     # DEBUG: Show master grid state before spanning tree computation
     print("DEBUG: Master grid state before spanning tree computation:")
@@ -1035,16 +1067,112 @@ def register_tiles_batched(
     
     return master_grid, prop_dict
 
-@dataclass
-class RowInfo:
-    """Information about a row of tiles.
+
+def register_tiles(
+    path: Union[str, Path],
+    mode: RegistrationMode = RegistrationMode.AUTO,
+    csv_path: Optional[Union[str, Path]] = None,
+    output_csv_path: Optional[Union[str, Path]] = None,
+    channel_pattern: Optional[str] = None,
+    overlap_diff_threshold: float = 10,
+    pou: float = 3,
+    ncc_threshold: float = 0.5,
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+    z_slice_to_keep: Optional[int] = 0,
+    tensor_backend_engine: Optional[str] = None,
+    flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
+    registration_channel: int = 0,
+    skip_backup: bool = False
+) -> Union[Tuple[pd.DataFrame, dict], pd.DataFrame, Dict[int, pd.DataFrame]]:
+    """Unified entry point for tile registration.
     
-    Attributes:
-        center_y: Y-coordinate of the row center in mm
-        tile_indices: List of indices for tiles in this row
+    Args:
+        path: Path to directory or files
+        mode: Registration mode (SINGLE, AUTO, MULTI_TIMEPOINT)
+        csv_path: Path to coordinates CSV (for SINGLE/AUTO modes)
+        output_csv_path: Path to save output (for AUTO mode)
+        channel_pattern: Pattern to match image files
+        overlap_diff_threshold: Allowed difference from initial guess (%)
+        pou: Percent overlap uncertainty
+        ncc_threshold: Normalized cross correlation threshold
+        edge_width: Width of edge strips for correlation
+        z_slice_to_keep: Z-slice to use for registration
+        tensor_backend_engine: Preferred backend ('cupy', 'torch', 'numpy')
+        flatfield_corrections: Precomputed flatfield corrections
+        registration_channel: Channel to use for registration
+        skip_backup: Skip creating backup of coordinates file
+        
+    Returns:
+        Depends on mode:
+        - SINGLE: Tuple[pd.DataFrame, dict] (results, properties)
+        - AUTO: pd.DataFrame (updated coordinates)
+        - MULTI_TIMEPOINT: Dict[int, pd.DataFrame] (timepoint -> coordinates)
     """
-    center_y: float
-    tile_indices: List[int]
+    path = Path(path)
+    
+    if mode == RegistrationMode.SINGLE:
+        # Direct batched processing of provided files
+        if csv_path is None:
+            raise ValueError("csv_path required for SINGLE mode")
+        
+        coords_df = read_coordinates_csv(csv_path)
+        
+        # Get image files
+        if path.is_dir():
+            if channel_pattern is None:
+                channel_pattern = select_channel_pattern(path)
+            image_paths = sorted(path.glob(channel_pattern))
+        else:
+            image_paths = [path]
+        
+        return register_tiles_batched(
+            selected_tiff_paths=image_paths,
+            region_coords=coords_df,
+            edge_width=edge_width,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            z_slice_to_keep=z_slice_to_keep,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections,
+            registration_channel=registration_channel
+        )
+    
+    elif mode == RegistrationMode.AUTO:
+        # Auto-detect and update coordinates
+        if csv_path is None or output_csv_path is None:
+            raise ValueError("csv_path and output_csv_path required for AUTO mode")
+        
+        return register_and_update_coordinates(
+            image_directory=path,
+            csv_path=csv_path,
+            output_csv_path=output_csv_path,
+            channel_pattern=channel_pattern,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            skip_backup=skip_backup,
+            z_slice_for_registration=z_slice_to_keep,
+            edge_width=edge_width,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections
+        )
+    
+    elif mode == RegistrationMode.MULTI_TIMEPOINT:
+        # Process multiple timepoints
+        return process_multiple_timepoints(
+            base_directory=path,
+            overlap_diff_threshold=overlap_diff_threshold,
+            pou=pou,
+            ncc_threshold=ncc_threshold,
+            edge_width=edge_width,
+            tensor_backend_engine=tensor_backend_engine,
+            flatfield_corrections=flatfield_corrections
+        )
+    
+    else:
+        raise ValueError(f"Unknown registration mode: {mode}")
+
 
 def extract_tile_indices(
     filenames: List[str],
@@ -1384,15 +1512,67 @@ def calculate_pixel_size_microns(
         raise ValueError("Could not calculate pixel size - no valid tile pairs found")
 
 
-def update_stage_coordinates(
+def update_coordinates(
     grid: pd.DataFrame,
     coords_df: pd.DataFrame,
     filename_to_index: Dict[str, int],
     filenames: List[str],
     pixel_size_um: float,
-    reference_idx: int = 0
+    reference_idx: int = 0,
+    full_coords_df: Optional[pd.DataFrame] = None,
+    region: Optional[str] = None
 ) -> pd.DataFrame:
-    """Update stage coordinates based on registration results.
+    """Unified coordinate update function for single and multi-z workflows.
+    
+    Replaces update_stage_coordinates and update_stage_coordinates_multi_z.
+    
+    Parameters
+    ----------
+    grid : pd.DataFrame
+        Registration results with pixel positions
+    coords_df : pd.DataFrame
+        Original coordinates to update (region-specific or full)
+    filename_to_index : Dict[str, int]
+        Mapping from filename to coordinate index
+    filenames : List[str]
+        Ordered list of filenames
+    pixel_size_um : float
+        Pixel size in microns
+    reference_idx : int
+        Index of reference tile (default 0)
+    full_coords_df : Optional[pd.DataFrame]
+        Full coordinates DataFrame for multi-region processing (optional)
+    region : Optional[str]
+        Current region being processed (optional, for multi-region)
+        
+    Returns
+    -------
+    updated_coords : pd.DataFrame
+        Updated coordinates with new stage positions
+    """
+    # Multi-region mode: work with full DataFrame
+    if full_coords_df is not None and region is not None:
+        return _update_coords_multi_region(
+            grid, coords_df, filename_to_index, filenames, 
+            pixel_size_um, full_coords_df, region, reference_idx
+        )
+    
+    # Single region mode: work with provided DataFrame
+    return _update_coords_single_region(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx
+    )
+
+
+def _update_coords_single_region(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    reference_idx: int
+) -> pd.DataFrame:
+    """Update coordinates for single region (internal helper).
     
     Parameters
     ----------
@@ -1485,6 +1665,76 @@ def update_stage_coordinates(
 
 
     return updated_coords
+
+
+def _update_coords_multi_region(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    full_coords_df: pd.DataFrame,
+    region: str,
+    reference_idx: int
+) -> pd.DataFrame:
+    """Update coordinates for multi-region processing (internal helper)."""
+    updated_coords = full_coords_df.copy()
+    
+    # Get reference position
+    ref_coord_idx = filename_to_index[filenames[reference_idx]]
+    ref_x_mm = coords_df.loc[ref_coord_idx, 'x (mm)']
+    ref_y_mm = coords_df.loc[ref_coord_idx, 'y (mm)']
+    ref_x_px = grid.loc[reference_idx, 'x_pos']
+    ref_y_px = grid.loc[reference_idx, 'y_pos']
+    
+    # Get FOV column name
+    fov_col_name = DEFAULT_FOV_COL
+    if fov_col_name not in coords_df.columns:
+        potential_fov_cols = [col for col in coords_df.columns if 'fov' in col.lower()]
+        if potential_fov_cols:
+            fov_col_name = potential_fov_cols[0]
+    
+    # Process each registered tile
+    for idx, row in grid.iterrows():
+        filename = filenames[idx]
+        coord_idx = filename_to_index[filename]
+        fov = coords_df.loc[coord_idx, fov_col_name]
+        
+        # Calculate position update
+        delta_x_px = row['x_pos'] - ref_x_px
+        delta_y_px = row['y_pos'] - ref_y_px
+        delta_x_mm = (delta_x_px * pixel_size_um) / 1000.0
+        delta_y_mm = (delta_y_px * pixel_size_um) / 1000.0
+        
+        new_x_mm = ref_x_mm + delta_x_mm
+        new_y_mm = ref_y_mm + delta_y_mm
+        
+        # Update all z-slices for this FOV in the same region
+        mask = (updated_coords['region'] == region) & (updated_coords[fov_col_name] == fov)
+        updated_coords.loc[mask, 'x (mm)'] = new_x_mm
+        updated_coords.loc[mask, 'y (mm)'] = new_y_mm
+        updated_coords.loc[mask, 'x_pos_px'] = row['x_pos']
+        updated_coords.loc[mask, 'y_pos_px'] = row['y_pos']
+    
+    return updated_coords
+
+
+def update_stage_coordinates(
+    grid: pd.DataFrame,
+    coords_df: pd.DataFrame,
+    filename_to_index: Dict[str, int],
+    filenames: List[str],
+    pixel_size_um: float,
+    reference_idx: int = 0
+) -> pd.DataFrame:
+    """[DEPRECATED] Use update_coordinates() instead.
+    
+    Legacy function for backward compatibility.
+    """
+    return update_coordinates(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx
+    )
 
 
 def read_coordinates_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
@@ -1808,75 +2058,14 @@ def update_stage_coordinates_multi_z(
     region: str,
     reference_idx: int = 0
 ) -> pd.DataFrame:
-    """Update stage coordinates for all z-slices based on registration results.
+    """[DEPRECATED] Use update_coordinates() instead.
     
-    Parameters
-    ----------
-    grid : pd.DataFrame
-        Registration results with pixel positions
-    coords_df : pd.DataFrame
-        Region-specific coordinates to update
-    filename_to_index : Dict[str, int]
-        Mapping from filename to coordinate index
-    filenames : List[str]
-        Ordered list of filenames
-    pixel_size_um : float
-        Pixel size in microns
-    full_coords_df : pd.DataFrame
-        Full coordinates DataFrame (all regions)
-    region : str
-        Current region being processed
-    reference_idx : int
-        Index of reference tile (default 0)
-        
-    Returns
-    -------
-    updated_coords : pd.DataFrame
-        Updated coordinates with new stage positions
+    Legacy function for backward compatibility with multi-z workflows.
     """
-    # Work with the full dataframe to update all z-slices
-    updated_coords = full_coords_df.copy()
-    
-    # Get reference position
-    ref_coord_idx = filename_to_index[filenames[reference_idx]]
-    ref_x_mm = coords_df.loc[ref_coord_idx, 'x (mm)']
-    ref_y_mm = coords_df.loc[ref_coord_idx, 'y (mm)']
-    ref_x_px = grid.loc[reference_idx, 'x_pos']
-    ref_y_px = grid.loc[reference_idx, 'y_pos']
-    
-    # Get FOV column name
-    fov_col_name = DEFAULT_FOV_COL
-    if fov_col_name not in coords_df.columns:
-        potential_fov_cols = [col for col in coords_df.columns if 'fov' in col.lower()]
-        if potential_fov_cols:
-            fov_col_name = potential_fov_cols[0]
-            logger.info(f"Using '{fov_col_name}' as FOV column.")
-    
-    # Process each registered tile
-    for idx, row in grid.iterrows():
-        filename = filenames[idx]
-        coord_idx = filename_to_index[filename]
-        
-        # Get the FOV from this coordinate
-        fov = coords_df.loc[coord_idx, fov_col_name]
-        
-        # Calculate the position update
-        delta_x_px = row['x_pos'] - ref_x_px
-        delta_y_px = row['y_pos'] - ref_y_px
-        delta_x_mm = (delta_x_px * pixel_size_um) / 1000.0
-        delta_y_mm = (delta_y_px * pixel_size_um) / 1000.0
-        
-        new_x_mm = ref_x_mm + delta_x_mm
-        new_y_mm = ref_y_mm + delta_y_mm
-        
-        # Update all z-slices for this FOV in the same region
-        mask = (updated_coords['region'] == region) & (updated_coords[fov_col_name] == fov)
-        updated_coords.loc[mask, 'x (mm)'] = new_x_mm
-        updated_coords.loc[mask, 'y (mm)'] = new_y_mm
-        updated_coords.loc[mask, 'x_pos_px'] = row['x_pos']
-        updated_coords.loc[mask, 'y_pos_px'] = row['y_pos']
-    
-    return updated_coords
+    return update_coordinates(
+        grid, coords_df, filename_to_index, filenames,
+        pixel_size_um, reference_idx, full_coords_df, region
+    )
 
 
 def detect_channels(directory: Union[str, Path]) -> Dict[str, List[Path]]:
@@ -2063,14 +2252,13 @@ def _compute_direction_translations(args):
         
         yins_edge, xins_edge, _ = multi_peak_max(PCM_on_edges)
         
-        # interpret_translation works with edges and edge-based limits,
-        # returns (ncc_val, y_best_edge_relative, x_best_edge_relative)
-        ncc_val, y_best_edge_relative, x_best_edge_relative = interpret_translation_ransac(
+        # Compute translation with RANSAC strategy (includes subpixel + optimization)
+        ncc_val, y_best_edge_relative, x_best_edge_relative = compute_translation(
             edge1, edge2, yins_edge, xins_edge, *lims_edge_relative[0], *lims_edge_relative[1],
-            n=10,  # More candidates for RANSAC
+            strategy=TranslationStrategy.RANSAC,
+            n=10,
             ransac_config=RANSACConfig(use_ransac=True, residual_threshold=2.0, min_inlier_ratio=0.3),
             subpixel_config=SubpixelConfig(upsample_factor=100, use_subpixel=True),
-            use_continuous_optimization=True,
             optimization_config=OptimizationConfig(method='trf', max_nfev=50, verbose=0)
         )
         
@@ -2112,7 +2300,9 @@ def register_and_update_coordinates(
     tensor_backend_engine: Optional[str] = None,
     flatfield_corrections: Optional[Dict[int, np.ndarray]] = None
 ) -> pd.DataFrame:
-    """Register tiles and update stage coordinates for all regions.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.AUTO) instead.
+    
+    Register tiles and update stage coordinates for all regions.
     
     Parameters
     ----------
@@ -2416,7 +2606,9 @@ def process_multiple_timepoints(
     tensor_backend_engine: Optional[str] = None,
     flatfield_corrections: Optional[Dict[int, np.ndarray]] = None
 ) -> Dict[int, pd.DataFrame]:
-    """Process multiple timepoints from a directory.
+    """[DEPRECATED] Use register_tiles(mode=RegistrationMode.MULTI_TIMEPOINT) instead.
+    
+    Process multiple timepoints from a directory.
     
     Parameters
     ----------

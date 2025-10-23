@@ -700,7 +700,7 @@ class StitchingGUI(QWidget):
             else:
                 try:
                     # Test if backend can be created and actually works (no fallback)
-                    backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    backend = create_tensor_backend(engine_name, allow_fallback=False)
                     gpu_status = " (GPU)" if backend.is_gpu else " (CPU)"
                     display_with_status = display_name.replace("(GPU/CPU)", gpu_status).replace("(NVIDIA GPU)", gpu_status)
                     self._available_backends.append((display_with_status, engine_name))
@@ -734,14 +734,14 @@ class StitchingGUI(QWidget):
             
             if engine_name is None:
                 # Auto selection - detect current backend
-                current_backend = create_tensor_backend(None, test_functionality=True)
+                current_backend = create_tensor_backend(None)
                 backend_name = current_backend.name
                 gpu_status = "GPU" if current_backend.is_gpu else "CPU"
                 status_text = f"Auto-selected: {backend_name.upper()} ({gpu_status})"
             else:
                 # Manual selection
                 try:
-                    selected_backend = create_tensor_backend(engine_name, test_functionality=True, allow_fallback=False)
+                    selected_backend = create_tensor_backend(engine_name, allow_fallback=False)
                     backend_name = selected_backend.name
                     gpu_status = "GPU" if selected_backend.is_gpu else "CPU"
                     status_text = f"Selected: {backend_name.upper()} ({gpu_status})"
@@ -1266,7 +1266,7 @@ class StitchingGUI(QWidget):
         #     return
         #     
         # try:
-        #     from .registration.fixed_registration import launch_fixed_registration
+        #     from .registration.manual import launch_fixed_registration
         #     success = launch_fixed_registration(self.inputDirectory)
         #     if success:
         #         self.statusLabel.setText("Status: Fixed registration applied")

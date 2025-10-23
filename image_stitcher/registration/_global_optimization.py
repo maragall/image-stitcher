@@ -10,6 +10,7 @@ The module includes:
 - Robust handling of disconnected components
 """
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -26,8 +27,80 @@ VALID_TRANSLATION_WEIGHT_BONUS = 10.0
 MIN_VALID_WEIGHT = -1.0
 MAX_VALID_WEIGHT = 1.0 + VALID_TRANSLATION_WEIGHT_BONUS
 
+
+@dataclass
+class TileGrid:
+    """Validated tile grid with type-enforced structure.
+    
+    Replaces 6 validation functions with simple construction validation.
+    """
+    df: pd.DataFrame
+    column_scheme: Dict[str, str]
+    
+    @classmethod
+    def from_dataframe(cls, grid: pd.DataFrame) -> 'TileGrid':
+        """Create validated TileGrid from DataFrame.
+        
+        Args:
+            grid: DataFrame with tile data
+            
+        Returns:
+            Validated TileGrid instance
+            
+        Raises:
+            TypeError: If input is not a DataFrame
+            ValueError: If structure is invalid
+        """
+        if not isinstance(grid, pd.DataFrame):
+            raise TypeError(f"Expected pandas DataFrame, got {type(grid).__name__}")
+        
+        if grid.empty:
+            raise ValueError("Empty grid DataFrame")
+        
+        # Detect column scheme
+        scheme = cls._detect_columns(grid)
+        
+        # Validate at least one direction exists
+        has_left = all(scheme.get(f'left_{c}') in grid.columns for c in ['x', 'y', 'ncc'])
+        has_top = all(scheme.get(f'top_{c}') in grid.columns for c in ['x', 'y', 'ncc'])
+        
+        if not (has_left or has_top):
+            raise ValueError("No complete direction column sets found")
+        
+        # Basic range validation
+        for direction in ['left', 'top']:
+            ncc_col = scheme.get(f'{direction}_ncc')
+            if ncc_col in grid.columns:
+                ncc_vals = grid[ncc_col].dropna()
+                if len(ncc_vals) > 0 and not ncc_vals.between(-1.0, 1.0).all():
+                    raise ValueError(f"Invalid NCC values in {ncc_col}")
+        
+        return cls(df=grid, column_scheme=scheme)
+    
+    @staticmethod
+    def _detect_columns(grid: pd.DataFrame) -> Dict[str, str]:
+        """Detect column naming convention."""
+        # Check for _first suffix (newer)
+        first_suffix = {'left_x': 'left_x_first', 'left_y': 'left_y_first', 
+                       'left_ncc': 'left_ncc_first', 'top_x': 'top_x_first',
+                       'top_y': 'top_y_first', 'top_ncc': 'top_ncc_first'}
+        
+        # Check for no suffix (older)
+        no_suffix = {'left_x': 'left_x', 'left_y': 'left_y', 'left_ncc': 'left_ncc',
+                    'top_x': 'top_x', 'top_y': 'top_y', 'top_ncc': 'top_ncc'}
+        
+        first_matches = sum(1 for col in first_suffix.values() if col in grid.columns)
+        no_matches = sum(1 for col in no_suffix.values() if col in grid.columns)
+        
+        scheme = first_suffix if first_matches >= no_matches else no_suffix
+        scheme.update({'left_valid3': 'left_valid3', 'top_valid3': 'top_valid3'})
+        return scheme
+
+
 def validate_grid_dataframe(grid: pd.DataFrame) -> None:
-    """Enhanced validation with better error handling and flexibility.
+    """[DEPRECATED] Use TileGrid.from_dataframe() instead.
+    
+    Legacy validation function - replaced by TileGrid dataclass.
     
     Args:
         grid: DataFrame to validate
@@ -36,230 +109,9 @@ def validate_grid_dataframe(grid: pd.DataFrame) -> None:
         TypeError: If input is not a pandas DataFrame
         ValueError: If DataFrame structure or content is invalid
     """
-    # 1. Basic structure validation
-    _validate_basic_structure(grid)
-    
-    # 2. Detect column naming scheme
-    column_scheme = _detect_column_scheme(grid)
-    
-    # 3. Validate required columns exist with context awareness
-    _validate_required_columns_exist(grid, column_scheme)
-    
-    # 4. Validate data types and value ranges
-    _validate_data_types_and_ranges(grid, column_scheme)
-    
-    # 5. Check logical consistency
-    _validate_logical_consistency(grid, column_scheme)
+    # Delegate to TileGrid which does proper validation
+    TileGrid.from_dataframe(grid)
 
-
-def _validate_basic_structure(grid: pd.DataFrame) -> None:
-    """Check basic DataFrame properties.
-    
-    Args:
-        grid: DataFrame to validate
-        
-    Raises:
-        TypeError: If input is not a pandas DataFrame
-        ValueError: If DataFrame is empty
-    """
-    if not isinstance(grid, pd.DataFrame):
-        raise TypeError(f"Expected pandas DataFrame, got {type(grid).__name__}")
-    
-    if grid.empty:
-        raise ValueError("Empty grid DataFrame")
-
-
-def _detect_column_scheme(grid: pd.DataFrame) -> Dict[str, str]:
-    """Intelligently detect which naming convention is used.
-    
-    Args:
-        grid: DataFrame to analyze
-        
-    Returns:
-        Dictionary mapping column types to actual column names found
-    """
-    scheme = {}
-    
-    # Check for _first suffix columns (newer convention)
-    first_suffix_cols = {
-        'left_x': 'left_x_first',
-        'left_y': 'left_y_first', 
-        'left_ncc': 'left_ncc_first',
-        'top_x': 'top_x_first',
-        'top_y': 'top_y_first',
-        'top_ncc': 'top_ncc_first'
-    }
-    
-    # Check for non-suffix columns (older convention)
-    no_suffix_cols = {
-        'left_x': 'left_x',
-        'left_y': 'left_y',
-        'left_ncc': 'left_ncc', 
-        'top_x': 'top_x',
-        'top_y': 'top_y',
-        'top_ncc': 'top_ncc'
-    }
-    
-    # Count matches for each convention
-    first_suffix_matches = sum(1 for col in first_suffix_cols.values() if col in grid.columns)
-    no_suffix_matches = sum(1 for col in no_suffix_cols.values() if col in grid.columns)
-    
-    # Choose the convention with more matches
-    if first_suffix_matches >= no_suffix_matches:
-        scheme.update(first_suffix_cols)
-    else:
-        scheme.update(no_suffix_cols)
-    
-    # Valid3 columns are consistent across conventions
-    scheme.update({
-        'left_valid3': 'left_valid3',
-        'top_valid3': 'top_valid3'
-    })
-    
-    return scheme
-
-
-def _validate_required_columns_exist(grid: pd.DataFrame, scheme: Dict[str, str]) -> None:
-    """Validate columns exist with context-aware requirements.
-    
-    Args:
-        grid: DataFrame to validate
-        scheme: Column name mapping from _detect_column_scheme
-        
-    Raises:
-        ValueError: If essential columns are missing
-    """
-    missing_cols = []
-    available_direction_cols = []
-    
-    # Check which direction columns exist
-    for direction in ['left', 'top']:
-        direction_cols = [f'{direction}_x', f'{direction}_y', f'{direction}_ncc', f'{direction}_valid3']
-        missing_direction_cols = [col_type for col_type in direction_cols 
-                                if scheme.get(col_type) not in grid.columns]
-        
-        if missing_direction_cols:
-            missing_cols.extend([scheme.get(col_type, col_type) for col_type in missing_direction_cols])
-        else:
-            available_direction_cols.append(direction)
-    
-    # We need at least one complete direction set for connectivity
-    if not available_direction_cols:
-        # Show what columns are actually available for debugging
-        direction_related_cols = [col for col in grid.columns 
-                                if any(d in col.lower() for d in ['left', 'top']) 
-                                and not col.startswith('_')]  # Exclude private columns
-        
-        raise ValueError(
-            f"No complete direction column sets found. "
-            f"Need at least one of: left_* or top_* column groups. "
-            f"Missing columns: {missing_cols}. "
-            f"Available direction-related columns: {direction_related_cols}"
-        )
-    
-    logger.info(f"Found complete column sets for directions: {available_direction_cols}")
-
-
-def _validate_data_types_and_ranges(grid: pd.DataFrame, scheme: Dict[str, str]) -> None:
-    """Validate data types and value ranges.
-    
-    Args:
-        grid: DataFrame to validate
-        scheme: Column name mapping
-        
-    Raises:
-        ValueError: If data types or ranges are invalid
-    """
-    for direction in ['left', 'top']:
-        # Check NCC values are in valid range [-1, 1]
-        ncc_col = scheme.get(f'{direction}_ncc')
-        if ncc_col in grid.columns:
-            ncc_values = grid[ncc_col].dropna()
-            if len(ncc_values) > 0:
-                if not ncc_values.between(-1.0, 1.0).all():
-                    invalid_count = (~ncc_values.between(-1.0, 1.0)).sum()
-                    raise ValueError(
-                        f"Invalid NCC values in {ncc_col}: {invalid_count} values outside [-1, 1] range. "
-                        f"Range found: [{ncc_values.min():.3f}, {ncc_values.max():.3f}]"
-                    )
-        
-        # Check translation values are reasonable (not infinity or extremely large)
-        for coord in ['x', 'y']:
-            coord_col = scheme.get(f'{direction}_{coord}')
-            if coord_col in grid.columns:
-                coord_values = grid[coord_col].dropna()
-                if len(coord_values) > 0:
-                    if not np.isfinite(coord_values).all():
-                        invalid_count = (~np.isfinite(coord_values)).sum()
-                        raise ValueError(
-                            f"Invalid {coord} translation values in {coord_col}: "
-                            f"{invalid_count} non-finite values found"
-                        )
-                    
-                    # Check for suspiciously large values (likely indicates an error)
-                    max_reasonable = 10000  # pixels
-                    if coord_values.abs().max() > max_reasonable:
-                        raise ValueError(
-                            f"Suspiciously large translation values in {coord_col}: "
-                            f"max absolute value {coord_values.abs().max():.1f} > {max_reasonable}"
-                        )
-        
-        # Check valid3 columns are boolean-like
-        valid3_col = scheme.get(f'{direction}_valid3')
-        if valid3_col in grid.columns:
-            valid3_values = grid[valid3_col].dropna()
-            if len(valid3_values) > 0:
-                unique_vals = set(valid3_values.unique())
-                if not unique_vals.issubset({True, False, 0, 1}):
-                    raise ValueError(
-                        f"Invalid boolean values in {valid3_col}: "
-                        f"found {unique_vals}, expected boolean or 0/1"
-                    )
-
-
-def _validate_logical_consistency(grid: pd.DataFrame, scheme: Dict[str, str]) -> None:
-    """Check logical relationships between data.
-    
-    Args:
-        grid: DataFrame to validate
-        scheme: Column name mapping
-        
-    Raises:
-        ValueError: If logical inconsistencies are found
-    """
-    # Check that left/top index references are valid
-    for direction in ['left', 'top']:
-        direction_col = direction
-        if direction_col in grid.columns:
-            valid_indices = grid[direction_col].dropna()
-            if len(valid_indices) > 0:
-                # Check indices are within DataFrame bounds
-                invalid_indices = valid_indices[(valid_indices < 0) | (valid_indices >= len(grid))]
-                if len(invalid_indices) > 0:
-                    raise ValueError(
-                        f"Invalid {direction} indices found: {invalid_indices.tolist()} "
-                        f"(DataFrame has {len(grid)} rows, valid range: 0-{len(grid)-1})"
-                    )
-    
-    # Check for suspicious patterns that might indicate data issues
-    for direction in ['left', 'top']:
-        ncc_col = scheme.get(f'{direction}_ncc')
-        if ncc_col in grid.columns:
-            ncc_values = grid[ncc_col].dropna()
-            if len(ncc_values) > 10:  # Only check if we have enough data
-                # Warn if all NCC values are identical (suspicious)
-                if ncc_values.nunique() == 1:
-                    logger.warning(
-                        f"All {direction} NCC values are identical ({ncc_values.iloc[0]:.3f}). "
-                        "This might indicate a processing error."
-                    )
-                
-                # Warn if NCC values are suspiciously low
-                if ncc_values.max() < 0.1:
-                    logger.warning(
-                        f"All {direction} NCC values are very low (max: {ncc_values.max():.3f}). "
-                        "This might indicate poor image quality or misalignment."
-                    )
 
 def compute_maximum_spanning_tree(grid: pd.DataFrame) -> nx.Graph:
     """Compute maximum spanning tree for global tile position optimization.
@@ -311,10 +163,32 @@ def compute_maximum_spanning_tree(grid: pd.DataFrame) -> nx.Graph:
                     logger.warning(f"Invalid neighbor index for tile {i} {direction}: {g[direction]}")
                     continue
                 
-                # Validate translation values
+                # Validate translation values (inline validation)
                 try:
-                    y_translation = _validate_translation_value(g[y_col], f"{direction}_y")
-                    x_translation = _validate_translation_value(g[x_col], f"{direction}_x")
+                    y_val, x_val = g[y_col], g[x_col]
+                    
+                    # Validate Y translation
+                    if pd.isna(y_val):
+                        raise ValueError(f"NaN translation value for {direction}_y")
+                    if not isinstance(y_val, (int, float, np.number)):
+                        raise ValueError(f"Invalid translation value type for {direction}_y: {type(y_val)}")
+                    if not np.isfinite(y_val):
+                        raise ValueError(f"Non-finite translation value for {direction}_y: {y_val}")
+                    if abs(y_val) > 10000:  # pixels
+                        raise ValueError(f"Suspiciously large translation value for {direction}_y: {abs(y_val)} > 10000")
+                    
+                    # Validate X translation
+                    if pd.isna(x_val):
+                        raise ValueError(f"NaN translation value for {direction}_x")
+                    if not isinstance(x_val, (int, float, np.number)):
+                        raise ValueError(f"Invalid translation value type for {direction}_x: {type(x_val)}")
+                    if not np.isfinite(x_val):
+                        raise ValueError(f"Non-finite translation value for {direction}_x: {x_val}")
+                    if abs(x_val) > 10000:
+                        raise ValueError(f"Suspiciously large translation value for {direction}_x: {abs(x_val)} > 10000")
+                    
+                    y_translation = float(y_val)
+                    x_translation = float(x_val)
                 except ValueError as e:
                     logger.warning(f"Skipping {direction} connection for tile {i}: {e}")
                     continue
@@ -366,8 +240,24 @@ def compute_maximum_spanning_tree(grid: pd.DataFrame) -> nx.Graph:
             f"Tiles may be too far apart or have insufficient overlap for registration."
         )
     
-    # Validate all edge weights before MST computation
-    _validate_graph_weights(connection_graph)
+    # Validate all edge weights before MST computation (inline validation)
+    invalid_edges = []
+    for u, v, data in connection_graph.edges(data=True):
+        weight = data.get('weight')
+        if weight is None:
+            invalid_edges.append((u, v, "missing weight"))
+        elif pd.isna(weight):
+            invalid_edges.append((u, v, "NaN weight"))
+        elif not isinstance(weight, (int, float, np.number)):
+            invalid_edges.append((u, v, f"invalid weight type: {type(weight)}"))
+        elif not np.isfinite(weight):
+            invalid_edges.append((u, v, f"non-finite weight: {weight}"))
+    
+    if invalid_edges:
+        error_summary = "; ".join([f"Edge ({u},{v}): {error}" for u, v, error in invalid_edges[:5]])
+        if len(invalid_edges) > 5:
+            error_summary += f"; ... and {len(invalid_edges) - 5} more"
+        raise ValueError(f"Invalid edge weights found: {error_summary}")
         
     # Compute maximum spanning tree
     try:
@@ -479,68 +369,6 @@ def _compute_edge_weight(row: pd.Series, ncc_col: str, direction: str) -> Option
         logger.warning(f"Column {valid3_col} not found, skipping validation bonus")
     
     return weight
-
-
-def _validate_translation_value(value: float, coord_name: str) -> float:
-    """Validate translation coordinate value.
-    
-    Args:
-        value: Translation value to validate
-        coord_name: Name of coordinate for error messages
-        
-    Returns:
-        Validated translation value
-        
-    Raises:
-        ValueError: If value is invalid
-    """
-    if pd.isna(value):
-        raise ValueError(f"NaN translation value for {coord_name}")
-    
-    if not isinstance(value, (int, float, np.number)):
-        raise ValueError(f"Invalid translation value type for {coord_name}: {type(value)}")
-    
-    if not np.isfinite(value):
-        raise ValueError(f"Non-finite translation value for {coord_name}: {value}")
-    
-    # Check for suspiciously large values
-    max_reasonable = 10000  # pixels
-    if abs(value) > max_reasonable:
-        raise ValueError(
-            f"Suspiciously large translation value for {coord_name}: {abs(value)} > {max_reasonable}"
-        )
-    
-    return float(value)
-
-
-def _validate_graph_weights(graph: nx.Graph) -> None:
-    """Validate all edge weights in the graph before MST computation.
-    
-    Args:
-        graph: NetworkX graph to validate
-        
-    Raises:
-        ValueError: If any weights are invalid
-    """
-    invalid_edges = []
-    
-    for u, v, data in graph.edges(data=True):
-        weight = data.get('weight')
-        
-        if weight is None:
-            invalid_edges.append((u, v, "missing weight"))
-        elif pd.isna(weight):
-            invalid_edges.append((u, v, "NaN weight"))
-        elif not isinstance(weight, (int, float, np.number)):
-            invalid_edges.append((u, v, f"invalid weight type: {type(weight)}"))
-        elif not np.isfinite(weight):
-            invalid_edges.append((u, v, f"non-finite weight: {weight}"))
-    
-    if invalid_edges:
-        error_summary = "; ".join([f"Edge ({u},{v}): {error}" for u, v, error in invalid_edges[:5]])
-        if len(invalid_edges) > 5:
-            error_summary += f"; ... and {len(invalid_edges) - 5} more"
-        raise ValueError(f"Invalid edge weights found: {error_summary}")
 
 
 def compute_final_position(
