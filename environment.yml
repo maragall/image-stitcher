@@ -5,12 +5,14 @@ channels:
   - nvidia
 dependencies:
   - python=3.10
+  # Pin scipy and pandas to prevent basicpy downgrade issues
+  - scipy>=1.14
+  - pandas>=2.0.0
   - aicsimageio
   - dask-image
   - numpy
   - ome-zarr
   - zarr
-  - pandas
   - psutil
   - pydantic>=2.10.5
   - pydantic-core>=2.27.2
@@ -34,10 +36,12 @@ dependencies:
   - pip:
     # Pin hyperactive to a known-good Windows-compatible version
     - hyperactive==4.5.0
+    # Install jax with Windows-compatible versions that work with scipy>=1.14
+    - "jax[cpu]>=0.4.30,<0.5.0"
+    - "jaxlib>=0.4.30,<0.5.0"
+    # Install basicpy after jax to prevent dependency conflicts
+    - basicpy>=1.2.0
   # CuPy will be installed via pip in setup scripts for better compatibility
-  # NOTE: basicpy must be installed in your conda environment with pip.  Run the ./setup_ubuntu_22_04.sh script
-  # to handle this, or with your conda environment activated run pip install basicpy.  There is no basicpy
-  # package on conda-forge, and the installations instructions suggest pip:
-  #   https://basicpy.readthedocs.io/en/latest/installation.html
-  # The pip approach seems to handle the jax deps better as well.
-  # - basicpy
+  # NOTE: basicpy is now installed via pip above with compatible jax versions.
+  # This prevents the scipy 1.15→1.12 downgrade that causes memory allocation
+  # failures on Windows systems with limited virtual memory.
