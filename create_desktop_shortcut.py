@@ -100,7 +100,7 @@ def find_icon(project_root: Path) -> Path:
 # Windows --------------------------------------------------------------
 
 def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_base: Path) -> None:
-    """Create PowerShell launchers and .lnk shortcuts on Windows with conda activation."""
+    """Create .bat launchers and .lnk shortcuts on Windows with conda activation."""
     
     # Convert PNG to ICO if possible
     ico_path = None
@@ -113,7 +113,7 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
         except ImportError:
             print("[WARNING] PIL not available, using PNG icon")
     
-    # Create PowerShell script for image stitcher GUI
+    # Create batch file for image stitcher GUI
     script_name = "stitcher_gui.py"
     shortcut_name = "Cephla Image Stitcher"
     
@@ -121,25 +121,16 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
         print(f"[WARNING] image_stitcher/{script_name} not found, skipping...")
         return
             
-    # Create PowerShell script with conda activation (similar to run_gui.ps1)
-    ps1_path = project_root / f"start_{script_name.replace('.py', '')}.ps1"
-    ps1_content = (
-        "$ErrorActionPreference = \"Stop\"\r\n"
-        f"$scriptDir = \"{project_root}\"\r\n"
-        "Set-Location $scriptDir\r\n"
-        "\r\n"
-        "# Setup conda, then activate the image-stitcher environment\r\n"
-        "Write-Host \"Setting up conda...\"\r\n"
-        "conda init powershell\r\n"
-        "conda shell.powershell hook | Out-String | Invoke-Expression\r\n"
-        "\r\n"
-        "Write-Host \"Activating the image-stitcher conda environment...\"\r\n"
-        "conda activate image-stitcher\r\n"
-        "\r\n"
-        f"Write-Host \"Running the image stitcher gui...\"\r\n"
+    # Create batch file with conda activation
+    bat_path = project_root / f"start_{script_name.replace('.py', '')}.bat"
+    bat_content = (
+        "@echo off\r\n"
+        f"call \"{conda_base}\\Scripts\\activate.bat\" image-stitcher\r\n"
+        f"cd /d \"{project_root}\"\r\n"
         f"python -m image_stitcher.{script_name.replace('.py', '')}\r\n"
+        "pause\r\n"
     )
-    ps1_path.write_text(ps1_content, encoding="utf-8")
+    bat_path.write_text(bat_content, encoding="utf-8")
     
     # Create shortcut
     lnk_path = desktop / f"{shortcut_name}.lnk"
@@ -147,8 +138,7 @@ def windows_shortcuts(project_root: Path, icon_png: Path, desktop: Path, conda_b
     ps_cmd = (
         "$WshShell = New-Object -ComObject WScript.Shell; "
         f"$Shortcut = $WshShell.CreateShortcut('{lnk_path}'); "
-        f"$Shortcut.TargetPath = 'powershell.exe'; "
-        f"$Shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File \"{ps1_path}\"'; "
+        f"$Shortcut.TargetPath = '{bat_path}'; "
         f"$Shortcut.IconLocation = '{ico_path or icon_png}'; "
         f"$Shortcut.WorkingDirectory = '{project_root}'; "
         "$Shortcut.Save()"
