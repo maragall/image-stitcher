@@ -1,18 +1,19 @@
-"""Registration module for image stitching.
+"""Image Stitcher Package.
 
-This module provides functionality for registering microscope image tiles
-without performing full stitching. Supports multiple tensor backends for
-CPU and GPU acceleration.
+This package provides tools for stitching microscope image tiles with support
+for flatfield correction, tile registration, and z-layer selection.
 
-Submodules:
-- tile_registration: Core automated registration algorithms
-- manual: GUI-based manual alignment tools
-- _global_optimization: Global position optimization
-- _tensor_backend: CPU/GPU tensor backend management
-- _translation_computation: Translation computation strategies
+Main functionality:
+- Image stitching: Combine image tiles into panoramic images
+- Tile registration: Automated and manual alignment of image tiles
+- Flatfield correction: Correct illumination artifacts
+- Z-layer selection: Optimal focal plane selection
+- Multiple tensor backends for CPU and GPU acceleration
+
+The package exposes key registration functions at the top level for convenience.
 """
 
-from .tile_registration import (
+from .registration.tile_registration import (
     register_tiles,
     RegistrationMode,
     register_tiles_batched,
@@ -23,10 +24,10 @@ from .tile_registration import (
     get_tensor_backend,
     set_tensor_backend
 )
-from ._constrained_refinement import refine_translations
-from ._global_optimization import compute_final_position, TileGrid
-from ._tensor_backend import create_tensor_backend, TensorBackend
-from ._translation_computation import compute_translation, TranslationStrategy
+from .registration._constrained_refinement import refine_translations
+from .registration._global_optimization import compute_final_position, TileGrid
+from .registration._tensor_backend import create_tensor_backend, TensorBackend
+from .registration._translation_computation import compute_translation, TranslationStrategy
 
 # Manual registration GUI is available as a submodule
 # from . import manual
