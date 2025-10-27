@@ -31,6 +31,9 @@ dependencies:
   - pytorch::pytorch
   - pytorch::torchvision
   - pytorch::pytorch-cuda=12.1  # For CUDA 12.x compatibility
+  - pip:
+    # Pin hyperactive to a known-good Windows-compatible version
+    - hyperactive==4.5.0
   # CuPy will be installed via pip in setup scripts for better compatibility
   # NOTE: basicpy must be installed in your conda environment with pip.  Run the ./setup_ubuntu_22_04.sh script
   # to handle this, or with your conda environment activated run pip install basicpy.  There is no basicpy
