@@ -231,18 +231,20 @@ class OMETiffLoader(ImageLoader):
         
         return self._metadata
     
-    def read_slice(self, channel: int = 0, z: int = 0) -> np.ndarray:
+    def read_slice(self, channel: int = 0, z: int = 0, t: int = 0) -> np.ndarray:
         """Read specific channel and Z-slice from OME-TIFF.
         
         Args:
             channel: Channel index (0-based)
             z: Z-slice index (0-based)
+            t: Timepoint index (0-based, default=0)
             
         Returns:
             2D numpy array of shape (height, width)
         """
         meta = self.metadata
         
+        # Validate indices
         if not (0 <= channel < meta['num_channels']):
             raise ValueError(
                 f"Channel {channel} out of range [0, {meta['num_channels']})"
@@ -251,55 +253,33 @@ class OMETiffLoader(ImageLoader):
             raise ValueError(
                 f"Z-slice {z} out of range [0, {meta['num_z']})"
             )
+        if not (0 <= t < meta.get('num_t', 1)):
+            raise ValueError(
+                f"Timepoint {t} out of range [0, {meta.get('num_t', 1)})"
+            )
         
         import tifffile
         with tifffile.TiffFile(self.filepath) as tif:
             series = tif.series[0]
             axes = meta['axes']
             
-            # Build index based on axes order
-            # Handle different axis orderings
-            if 'T' in axes:
-                # Multi-timepoint: we only read T=0 for now
-                if axes == 'TCZYX':
-                    img = series.asarray()[0, channel, z, :, :]
-                elif axes == 'TZCYX':
-                    # Time, Z, Channels, Y, X - swap C and Z order
-                    img = series.asarray()[0, z, channel, :, :]
-                elif axes == 'TZYX':
-                    if channel != 0:
-                        raise ValueError(f"No channel dimension, channel must be 0")
-                    img = series.asarray()[0, z, :, :]
-                elif axes == 'TCYX':
-                    if z != 0:
-                        raise ValueError(f"No Z dimension, z must be 0")
-                    img = series.asarray()[0, channel, :, :]
-                elif axes == 'TYX':
-                    if channel != 0 or z != 0:
-                        raise ValueError(f"2D+T image, channel and z must be 0")
-                    img = series.asarray()[0, :, :]
+            # Build index tuple dynamically based on axes order
+            index = []
+            for axis in axes:
+                if axis == 'T':
+                    index.append(t)
+                elif axis == 'C':
+                    index.append(channel)
+                elif axis == 'Z':
+                    index.append(z)
+                elif axis == 'Y':
+                    index.append(slice(None))  # Full slice for Y
+                elif axis == 'X':
+                    index.append(slice(None))  # Full slice for X
                 else:
-                    raise NotImplementedError(f"Axis order {axes} not yet supported")
-            else:
-                # Single timepoint
-                if axes == 'CZYX':
-                    img = series.asarray()[channel, z, :, :]
-                elif axes == 'ZYX':
-                    if channel != 0:
-                        raise ValueError(f"No channel dimension, channel must be 0")
-                    img = series.asarray()[z, :, :]
-                elif axes == 'CYX':
-                    if z != 0:
-                        raise ValueError(f"No Z dimension, z must be 0")
-                    img = series.asarray()[channel, :, :]
-                elif axes == 'YX':
-                    if channel != 0 or z != 0:
-                        raise ValueError(f"2D image, channel and z must be 0")
-                    img = series.asarray()
-                else:
-                    raise NotImplementedError(f"Axis order {axes} not yet supported")
+                    raise ValueError(f"Unsupported axis '{axis}' in axes '{axes}'")
             
-            return img
+            return series.asarray()[tuple(index)]
     
     def _extract_channel_names(self, ome_xml: str) -> Optional[list]:
         """Extract channel names from OME-XML metadata.
