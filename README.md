@@ -1,67 +1,48 @@
 # image-stitcher
 
-High-performance image stitching for microscopy with GPU acceleration support.
+image stitching for microscopy with GPU acceleration support.
 
-## Features
+## Setup from Scratch
 
-- Automatic selection of CuPy, PyTorch, or NumPy backends
-- GPU Acceleration: significant performance improvements for large-scale image registration  
-- Graceful fallback to CPU processing if GPU is unavailable
-- Works on Linux, our system of preference, and Windows
-
-## Setup
-
-### Pre-setup for linux (e.g. ubuntu)
-
-On linux, ensure you have the necessary system dependencies installed and
-conda environment setup. We provide a setup script for ubuntu 22.04
-that does this automatically:
-
+### Ubuntu 22.04
 ```bash
 ./setup_ubuntu_22_04.sh
 ```
+Installs conda (if needed), creates `image-stitcher` environment, and installs dependencies.
 
-This will set up a conda environment called `image-stitcher` with all the required dependencies,
-including PyTorch with CUDA support for GPU acceleration.
-
-### GPU Acceleration (Optional)
-
-For maximum performance, install CuPy for NVIDIA GPU acceleration:
-
+### Ubuntu 22.04 with CUDA (Optional)
 ```bash
-# Install CuPy for best GPU performance (Ubuntu only, compatible with Driver 535.x)
-./setup_gpu_ubuntu_22_04.sh
+./setup_cuda_22.04.sh
 ```
+Adds CuPy for optimal NVIDIA GPU performance (compatible with Driver 535.x).
 
-The system will automatically detect and use the best available backend:
-- **CuPy** (preferred) - Best performance for NVIDIA GPUs
-- **PyTorch** (included) - Good performance, wider hardware support
-- **NumPy** (fallback) - CPU-only, always available
+### Windows 11
+```powershell
+.\setup_windows_11.ps1
+```
+Installs conda (if needed), creates `image-stitcher` environment, and installs dependencies.
 
-### Test Your Installation
+### Windows 11 with CUDA (Optional)
+```powershell
+.\setup_cuda_windows_11.ps1
+```
+Adds CuPy for optimal NVIDIA GPU performance.
 
+### Desktop Shortcut (Optional)
 ```bash
-conda activate image-stitcher
-python test_dependencies.py
+python create_desktop_shortcut.py
 ```
-### Pre-setup for Non-Ubuntu OS
+Creates a desktop launcher that auto-activates the conda environment.
 
-For other environments, you will need to manually replicate the setup steps in `./setup_ubuntu_22_04.sh`.
+## Launch
 
-We use [BaSiCPy](https://basicpy.readthedocs.io/en/latest/installation.html) which can be finicky.  Specifically
-with respect to its jax depencency.  So far what has worked best is making sure to follow the exact suggestions
-in their installation page with respect to installing jax separately, or just running `pip install basicpy`.
-
-## Running The Stitcher
-### Run the GUI
-
-Activate the `image-stitcher` conda environment, then run `run_gui` script:
-```
+### GUI
+```bash
 ./run_gui
 ```
-
-To run the gui manually without the helper script, you can run the following from this directory:
-```
+Or manually:
+```bash
+conda activate image-stitcher
 python -m image_stitcher.stitcher_gui
 ```
 
@@ -75,15 +56,6 @@ The GUI includes a **Compute Backend** dropdown that allows you to select the te
 - **CuPy (NVIDIA GPU)** - Maximum performance with NVIDIA GPU acceleration
 
 The dropdown shows the actual backend status (GPU/CPU).. Backend selection affects the registration process performance significantly.
-
-## Running via the CLI
-
-You can run registration from the command line via the stitcher_cli module and
-its various configuration options. Run (with the conda `image-stitcher` environment activated):
-```
-python -m image_stitcher.stitcher_cli --help
-```
-to see the options and their documentation.
 
 ## Devtools
 
