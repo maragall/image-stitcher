@@ -73,10 +73,17 @@ class CupyBackend(TensorBackend):
         try:
             import cupy as cp
             self.cp = cp
+            # Test GPU functionality with a simple operation
+            test_array = cp.array([1.0, 2.0, 3.0])
+            _ = cp.sum(test_array)
+            cp.cuda.Device().synchronize()
             self.available = True
         except ImportError:
             self.available = False
             raise ImportError("CuPy not available")
+        except Exception as e:
+            self.available = False
+            raise RuntimeError(f"CuPy available but CUDA operations failed: {e}")
     
     @property
     def name(self) -> str:
@@ -137,10 +144,20 @@ class TorchBackend(TensorBackend):
             import torch
             self.torch = torch
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            
+            # Test GPU functionality if CUDA is reported as available
+            if self.device == 'cuda':
+                test_tensor = torch.tensor([1.0, 2.0, 3.0], device='cuda')
+                _ = torch.sum(test_tensor)
+                torch.cuda.synchronize()
+            
             self.available = True
         except ImportError:
             self.available = False
             raise ImportError("PyTorch not available")
+        except Exception as e:
+            self.available = False
+            raise RuntimeError(f"PyTorch available but CUDA operations failed: {e}")
     
     @property
     def name(self) -> str:
