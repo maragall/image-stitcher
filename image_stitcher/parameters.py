@@ -303,6 +303,9 @@ class StitchingComputedParameters:
         self.init_acquisition_parameters()
         self.init_pixel_size()
         
+        # Initialize flatfields to empty dict (will be populated later if needed)
+        self.flatfields = {}
+        
         # Detect image format
         self.image_format = self.detect_image_format()
         
