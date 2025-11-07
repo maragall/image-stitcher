@@ -127,6 +127,8 @@ class StitcherThread(QThread):
         self.tensor_backend_engine = tensor_backend_engine
         self.registration_complete = False
         self.registration_error = None
+        self.flatfield_corrections: dict[int, np.ndarray] | None = None
+        self.flatfield_manifest: pathlib.Path | None = None
         self.callbacks = ProgressCallbacks(
             update_progress=lambda a, b: None,
             getting_flatfields=lambda: None,
@@ -146,7 +148,8 @@ class StitcherThread(QThread):
                     pou=3,                       
                     ncc_threshold=0.5,           
                     edge_width=195,
-                    tensor_backend_engine=self.tensor_backend_engine
+                    tensor_backend_engine=self.tensor_backend_engine,
+                    flatfield_corrections=self.flatfield_corrections
                 )
                 logging.info("Registration completed successfully")
                 self.registration_complete = True
@@ -504,6 +507,96 @@ class StitchingGUI(QWidget):
             return
 
         try:
+            # Get flatfield mode selection
+            flatfield_mode = get_flatfield_mode_from_string(self.flatfieldModeCombo.currentText())
+            
+            # Check if registration should be run first based on checkbox state
+            perform_registration = self.runRegistrationCheckbox.isChecked()
+            
+            # Handle flatfield computation/loading if needed for registration
+            flatfield_corrections = None
+            flatfield_manifest = None
+            
+            if perform_registration and flatfield_mode != FlatfieldModeOption.NONE:
+                if flatfield_mode == FlatfieldModeOption.COMPUTE:
+                    # Compute flatfields before registration
+                    self.statusLabel.setText("Status: Computing flatfields...")
+                    self.progressBar.setRange(0, 0)
+                    self.progressBar.show()
+                    QApplication.processEvents()  # Update UI
+                    
+                    try:
+                        # Create temporary stitching parameters to compute flatfields
+                        temp_params = StitchingParameters(
+                            input_folder=self.inputDirectory,
+                            output_format=OutputFormat.ome_zarr,
+                            scan_pattern=ScanPattern.unidirectional,
+                            apply_flatfield=False  # Don't apply, just compute
+                        )
+                        temp_stitcher = Stitcher(temp_params)
+                        
+                        # Compute flatfields
+                        from .flatfield_correction import compute_flatfield_correction
+                        flatfield_corrections = compute_flatfield_correction(
+                            temp_stitcher.computed_parameters,
+                            lambda: None  # No progress callback needed
+                        )
+                        
+                        # Save flatfields for later use
+                        if flatfield_corrections:
+                            from .flatfield_utils import save_flatfield_correction
+                            acquisition_folder = pathlib.Path(self.inputDirectory)
+                            flatfield_dir = acquisition_folder / "flatfields"
+                            flatfield_manifest = save_flatfield_correction(
+                                flatfield_corrections,
+                                temp_stitcher.computed_parameters,
+                                flatfield_dir
+                            )
+                            self.computed_flatfields = flatfield_corrections
+                            self.flatfield_computed_params = temp_stitcher.computed_parameters
+                            logging.info(f"Computed flatfields saved to {flatfield_dir}")
+                        
+                    except Exception as e:
+                        logging.error(f"Failed to compute flatfields: {e}")
+                        QMessageBox.warning(
+                            self, "Flatfield Warning", 
+                            f"Failed to compute flatfields: {e}\nContinuing registration without flatfield correction."
+                        )
+                        flatfield_corrections = None
+                        
+                elif flatfield_mode == FlatfieldModeOption.LOAD:
+                    # Load precomputed flatfields
+                    if self.flatfield_manifest:
+                        flatfield_manifest = self.flatfield_manifest
+                        try:
+                            from .flatfield_utils import load_flatfield_correction
+                            temp_params = StitchingParameters(
+                                input_folder=self.inputDirectory,
+                                output_format=OutputFormat.ome_zarr,
+                                scan_pattern=ScanPattern.unidirectional
+                            )
+                            temp_stitcher = Stitcher(temp_params)
+                            
+                            flatfield_corrections = load_flatfield_correction(
+                                self.flatfield_manifest,
+                                temp_stitcher.computed_parameters
+                            )
+                            self.computed_flatfields = flatfield_corrections
+                            logging.info("Loaded flatfield corrections for registration")
+                        except Exception as e:
+                            logging.error(f"Failed to load flatfields: {e}")
+                            QMessageBox.warning(
+                                self, "Flatfield Warning",
+                                f"Failed to load flatfields: {e}\nContinuing registration without flatfield correction."
+                            )
+                            flatfield_corrections = None
+                            flatfield_manifest = None
+                    else:
+                        QMessageBox.warning(
+                            self, "Flatfield Warning",
+                            "No flatfield directory selected.\nContinuing registration without flatfield correction."
+                        )
+            
             # Create parameters from UI state
             format_text = self.outputFormatCombo.currentText()
             if format_text == "OME-ZARR":
@@ -512,9 +605,10 @@ class StitchingGUI(QWidget):
                 QMessageBox.critical(self, "Internal Error", f"Invalid output format selected: {format_text}")
                 return
 
-            flatfield_mode = get_flatfield_mode_from_string(self.flatfieldModeCombo.currentText())
             apply_flatfield = flatfield_mode != FlatfieldModeOption.NONE
-            flatfield_manifest = self.flatfield_manifest if flatfield_mode == FlatfieldModeOption.LOAD else None
+            if not perform_registration:
+                # If not performing registration, use manifest from GUI for stitching
+                flatfield_manifest = self.flatfield_manifest if flatfield_mode == FlatfieldModeOption.LOAD else None
 
             # Determine z-layer selection strategy
             z_layer_mode = self.zLayerModeCombo.currentIndex()
@@ -536,10 +630,6 @@ class StitchingGUI(QWidget):
                 z_layer_selection=z_layer_selection,
                 apply_mip=(z_layer_mode == 3),  # Set apply_mip based on the combo box index
             )
-
-            # Create and configure the stitcher thread
-            # Check if registration should be run first based on checkbox state
-            perform_registration = self.runRegistrationCheckbox.isChecked()
             
             # Get selected backend if registration is requested
             tensor_backend_engine = None
@@ -552,6 +642,11 @@ class StitchingGUI(QWidget):
                 image_directory=self.inputDirectory,
                 tensor_backend_engine=tensor_backend_engine
             )
+            
+            # Pass flatfield corrections to the stitcher thread for registration
+            if perform_registration and flatfield_corrections:
+                self.stitcher.flatfield_corrections = flatfield_corrections
+                self.stitcher.flatfield_manifest = flatfield_manifest
 
             # Set up callbacks
             self.stitcher.callbacks = ProgressCallbacks(
