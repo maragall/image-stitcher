@@ -8,6 +8,9 @@ from typing import Any, Callable, TypeAlias
 import dask.array as da
 import numpy as np
 import ome_zarr
+import ome_zarr.io
+import ome_zarr.writer
+import ome_zarr.format
 import psutil
 import skimage
 import zarr
@@ -183,14 +186,14 @@ class Stitcher:
             # for this case to test that out.
             chunks = self.computed_parameters.chunks
             output_path = self.paths.per_timepoint_region_output(timepoint, region)
-            store = zarr.storage.DirectoryStore(output_path)
-            root = zarr.group(store)
+            # zarr v3 API: LocalStore replaced DirectoryStore
+            store = zarr.storage.LocalStore(str(output_path))
+            root = zarr.group(store=store)
             return root.zeros(
                 name="0",
                 shape=output_shape,
                 dtype=self.computed_parameters.dtype,
                 chunks=chunks,
-                dimension_separator="/",
             )
 
     def place_tile(
@@ -512,9 +515,18 @@ class Stitcher:
             )
 
         # Configure storage options with optimal chunking
+        # Convert compression string to codecs (zarr v3) or compressor (zarr v2)
+        if self.params.output_compression == "none":
+            codecs_list = [zarr.codecs.BytesCodec()]
+        else:  # "default"
+            # Use Blosc codec with zstd compression for zarr v3
+            codecs_list = [
+                zarr.codecs.BytesCodec(),
+                zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+            ]
+        
         storage_opts = {
             "chunks": self.computed_parameters.chunks,
-            "compressor": self.params.output_compression,
         }
 
         if isinstance(stitched_region, zarr.Array):
@@ -529,17 +541,17 @@ class Stitcher:
 
         with debug_timing("write image data pyramid"):
             for pyramid_idx in range(start_index, len(pyramid)):
-                da.to_zarr(
-                    arr=pyramid[pyramid_idx],
-                    url=root.store,
-                    component=str(pathlib.Path(root.path) / str(pyramid_idx)),
-                    storage_options=storage_opts,
-                    compressor=storage_opts.get(
-                        "compressor", zarr.storage.default_compressor
-                    ),
-                    dimension_separator="/",
-                    compute=True,
+                # Write directly to the zarr group created by ome_zarr
+                array_name = str(pyramid_idx)
+                arr = root.create_array(
+                    name=array_name,
+                    shape=pyramid[pyramid_idx].shape,
+                    dtype=pyramid[pyramid_idx].dtype,
+                    chunks=storage_opts["chunks"],
+                    compressors=codecs_list[1:] if len(codecs_list) > 1 else None,  # Skip BytesCodec
                 )
+                # Store the dask array data into the zarr array
+                da.store(pyramid[pyramid_idx], arr, compute=True)
                 datasets.append({"path": str(pyramid_idx)})
 
         fmt = ome_zarr.format.CurrentFormat()
