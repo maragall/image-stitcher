@@ -4,12 +4,50 @@ from typing import Callable
 
 import numpy as np
 from basicpy import BaSiC
-from skimage.io import imread
 
 from .parameters import StitchingComputedParameters
 
 MAX_FLATFIELD_IMAGES_PER_T = 32
 MAX_FLATFIELD_IMAGES = 48
+
+
+def _load_tile_image(tile_info) -> np.ndarray:
+    """Load a single tile image using the appropriate loader.
+    
+    This handles different file formats (regular TIFF, multi-page TIFF, OME-TIFF)
+    by checking for frame_idx metadata and using the appropriate loading method.
+    
+    Parameters
+    ----------
+    tile_info : AcquisitionMetadata
+        Tile metadata containing filepath and frame_idx information
+        
+    Returns
+    -------
+    np.ndarray
+        2D image array of shape (height, width)
+    """
+    if hasattr(tile_info, 'frame_idx') and tile_info.frame_idx is not None:
+        # Check if it's an OME-TIFF (frame_idx is tuple) or multi-page TIFF (frame_idx is int)
+        if isinstance(tile_info.frame_idx, tuple):
+            # OME-TIFF: frame_idx is (channel_idx, z_idx)
+            from .image_loaders import create_image_loader
+            loader = create_image_loader(tile_info.filepath, format_hint='ome_tiff')
+            channel_idx, z_idx = tile_info.frame_idx
+            return loader.read_slice(channel=channel_idx, z=z_idx)
+        elif tile_info.frame_idx > 0:
+            # Multi-page TIFF file: frame_idx is page number
+            import tifffile
+            with tifffile.TiffFile(tile_info.filepath) as tif:
+                return tif.pages[tile_info.frame_idx].asarray()
+        else:
+            # frame_idx is 0, treat as single file
+            import skimage.io
+            return skimage.io.imread(tile_info.filepath)
+    else:
+        # Single file without frame_idx
+        import skimage.io
+        return skimage.io.imread(tile_info.filepath)
 
 
 def compute_flatfield_correction(
@@ -28,9 +66,9 @@ def compute_flatfield_correction(
             logging.warning(f"No images found for channel {channel_name}")
             return
 
-        if images.ndim != 3 and images.ndim != 4:
+        if images.ndim != 3:
             raise ValueError(
-                f"Images must be 3 or 4-dimensional array, with dimension of (T, Y, X) or (T, Z, Y, X). Got shape {images.shape}"
+                f"Images must be 3-dimensional array, with dimension of (N, Y, X). Got shape {images.shape}"
             )
 
         basic = BaSiC(get_darkfield=False, smoothness_flatfield=1)
@@ -66,20 +104,35 @@ def compute_flatfield_correction(
                 f"Limiting flatfield correction to {len(selected_tile_infos)} images instead of using all {len(all_tile_infos)}"
             )
 
-        images = [imread(tile.filepath) for tile in selected_tile_infos]
+        # Load images using the appropriate loader for each file type
+        images = []
+        for tile in selected_tile_infos:
+            try:
+                img = _load_tile_image(tile)
+                # Ensure 2D images are consistently shaped
+                if img.ndim == 2:
+                    images.append(img)
+                else:
+                    logging.warning(
+                        f"Loaded image from {tile.filepath} has unexpected shape {img.shape}, skipping"
+                    )
+            except Exception as e:
+                logging.warning(f"Failed to load image from {tile.filepath}: {e}")
+                continue
 
         if not images:
             logging.warning(f"No images found for channel {channel} for any timepoint")
             continue
 
+        # Stack images into a 3D array (N, Y, X)
         images = np.array(images)
 
-        if images.ndim in (3, 4):
-            # Images are in the shape (N, Y, X) or (N, Z, Y, X)
+        if images.ndim == 3:
+            # Images are in the expected shape (N, Y, X)
             process_images(images, channel)
         else:
             raise ValueError(
-                f"Unexpected number of dimensions in images array: {images.ndim}"
+                f"Unexpected number of dimensions in images array: {images.ndim}. Expected 3D array of shape (N, Y, X)."
             )
 
     return flatfields
