@@ -515,15 +515,17 @@ class Stitcher:
             )
 
         # Configure storage options with optimal chunking
-        # Convert compression string to codecs (zarr v3) or compressor (zarr v2)
+        # Convert compression string to codecs (zarr v3)
+        # Note: In zarr v3, BytesCodec is automatically added, so we only specify compression
         if self.params.output_compression == "none":
-            codecs_list = [zarr.codecs.BytesCodec()]
+            codecs_list = None
         else:  # "default"
             # Use Blosc codec with zstd compression for zarr v3
-            codecs_list = [
-                zarr.codecs.BytesCodec(),
-                zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-            ]
+            try:
+                codecs_list = [zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")]
+            except AttributeError:
+                # Fallback if BloscCodec is not available
+                codecs_list = None
         
         storage_opts = {
             "chunks": self.computed_parameters.chunks,
@@ -548,7 +550,7 @@ class Stitcher:
                     shape=pyramid[pyramid_idx].shape,
                     dtype=pyramid[pyramid_idx].dtype,
                     chunks=storage_opts["chunks"],
-                    compressors=codecs_list[1:] if len(codecs_list) > 1 else None,  # Skip BytesCodec
+                    compressors=codecs_list if codecs_list else None,
                 )
                 # Store the dask array data into the zarr array
                 da.store(pyramid[pyramid_idx], arr, compute=True)
