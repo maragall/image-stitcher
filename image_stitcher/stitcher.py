@@ -186,8 +186,17 @@ class Stitcher:
             # for this case to test that out.
             chunks = self.computed_parameters.chunks
             output_path = self.paths.per_timepoint_region_output(timepoint, region)
-            # zarr v3 API: LocalStore replaced DirectoryStore
-            store = zarr.storage.LocalStore(str(output_path))
+            
+            # Detect zarr version and use appropriate store API
+            zarr_major_version = int(zarr.__version__.split('.')[0])
+            
+            if zarr_major_version >= 3:
+                # zarr v3: use LocalStore
+                store = zarr.storage.LocalStore(str(output_path))
+            else:
+                # zarr v2: use DirectoryStore
+                store = zarr.storage.DirectoryStore(str(output_path))
+            
             root = zarr.group(store=store)
             return root.zeros(
                 name="0",
@@ -515,21 +524,36 @@ class Stitcher:
             )
 
         # Configure storage options with optimal chunking
-        # Convert compression string to codecs (zarr v3)
-        # Note: In zarr v3, BytesCodec is automatically added, so we only specify compression
-        if self.params.output_compression == "none":
-            codecs_list = None
-        else:  # "default"
-            # Use Blosc codec with zstd compression for zarr v3
-            try:
-                codecs_list = [zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")]
-            except AttributeError:
-                # Fallback if BloscCodec is not available
+        # Detect zarr version and configure compression accordingly
+        zarr_major_version = int(zarr.__version__.split('.')[0])
+        
+        if zarr_major_version >= 3:
+            # zarr v3: use codecs
+            if self.params.output_compression == "none":
                 codecs_list = None
+            else:  # "default"
+                try:
+                    codecs_list = [zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")]
+                except AttributeError:
+                    codecs_list = None
+            compressor_v2 = None
+        else:
+            # zarr v2: use compressor
+            codecs_list = None
+            if self.params.output_compression == "none":
+                compressor_v2 = None
+            else:  # "default"
+                try:
+                    from numcodecs import Blosc
+                    compressor_v2 = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)
+                except ImportError:
+                    compressor_v2 = None
         
         storage_opts = {
             "chunks": self.computed_parameters.chunks,
         }
+        if zarr_major_version < 3 and compressor_v2 is not None:
+            storage_opts["compressor"] = compressor_v2
 
         if isinstance(stitched_region, zarr.Array):
             # We already stored the higest resolution version it its target
@@ -543,15 +567,28 @@ class Stitcher:
 
         with debug_timing("write image data pyramid"):
             for pyramid_idx in range(start_index, len(pyramid)):
-                # Write directly to the zarr group created by ome_zarr
+                # Write to zarr array - compatible with both v2 and v3
                 array_name = str(pyramid_idx)
-                arr = root.create_array(
-                    name=array_name,
-                    shape=pyramid[pyramid_idx].shape,
-                    dtype=pyramid[pyramid_idx].dtype,
-                    chunks=storage_opts["chunks"],
-                    compressors=codecs_list if codecs_list else None,
-                )
+                
+                if zarr_major_version >= 3:
+                    # zarr v3: use create_array with compressors parameter
+                    arr = root.create_array(
+                        name=array_name,
+                        shape=pyramid[pyramid_idx].shape,
+                        dtype=pyramid[pyramid_idx].dtype,
+                        chunks=storage_opts["chunks"],
+                        compressors=codecs_list if codecs_list else None,
+                    )
+                else:
+                    # zarr v2: use zeros or create_dataset with compressor parameter
+                    arr = root.zeros(
+                        name=array_name,
+                        shape=pyramid[pyramid_idx].shape,
+                        dtype=pyramid[pyramid_idx].dtype,
+                        chunks=storage_opts["chunks"],
+                        compressor=storage_opts.get("compressor"),
+                    )
+                
                 # Store the dask array data into the zarr array
                 da.store(pyramid[pyramid_idx], arr, compute=True)
                 datasets.append({"path": str(pyramid_idx)})
