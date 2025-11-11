@@ -8,6 +8,9 @@ from typing import Any, Callable, TypeAlias
 import dask.array as da
 import numpy as np
 import ome_zarr
+import ome_zarr.io
+import ome_zarr.writer
+import ome_zarr.format
 import psutil
 import skimage
 import zarr
@@ -118,12 +121,23 @@ class Stitcher:
             raise ValueError(f"Unexpected tile shape: {tiles[0].shape}")
 
     def load_image(self, tile_info) -> np.ndarray:
-        """Load an image from file, handling both single files and multi-page TIFF files."""
-        if hasattr(tile_info, 'frame_idx') and tile_info.frame_idx > 0:
-            # Multi-page TIFF file
-            import tifffile
-            with tifffile.TiffFile(tile_info.filepath) as tif:
-                return tif.pages[tile_info.frame_idx].asarray()
+        """Load an image from file, handling single files, multi-page TIFF, and OME-TIFF files."""
+        if hasattr(tile_info, 'frame_idx') and tile_info.frame_idx is not None:
+            # Check if it's an OME-TIFF (frame_idx is tuple) or multi-page TIFF (frame_idx is int)
+            if isinstance(tile_info.frame_idx, tuple):
+                # OME-TIFF: frame_idx is (channel_idx, z_idx)
+                from .image_loaders import create_image_loader
+                loader = create_image_loader(tile_info.filepath, format_hint='ome_tiff')
+                channel_idx, z_idx = tile_info.frame_idx
+                return loader.read_slice(channel=channel_idx, z=z_idx)
+            elif tile_info.frame_idx > 0:
+                # Multi-page TIFF file: frame_idx is page number
+                import tifffile
+                with tifffile.TiffFile(tile_info.filepath) as tif:
+                    return tif.pages[tile_info.frame_idx].asarray()
+            else:
+                # frame_idx is 0, treat as single file
+                return skimage.io.imread(tile_info.filepath)
         else:
             # Single file
             return skimage.io.imread(tile_info.filepath)
@@ -172,14 +186,23 @@ class Stitcher:
             # for this case to test that out.
             chunks = self.computed_parameters.chunks
             output_path = self.paths.per_timepoint_region_output(timepoint, region)
-            store = zarr.storage.DirectoryStore(output_path)
-            root = zarr.group(store)
+            
+            # Detect zarr version and use appropriate store API
+            zarr_major_version = int(zarr.__version__.split('.')[0])
+            
+            if zarr_major_version >= 3:
+                # zarr v3: use LocalStore
+                store = zarr.storage.LocalStore(str(output_path))
+            else:
+                # zarr v2: use DirectoryStore
+                store = zarr.storage.DirectoryStore(str(output_path))
+            
+            root = zarr.group(store=store)
             return root.zeros(
                 name="0",
                 shape=output_shape,
                 dtype=self.computed_parameters.dtype,
                 chunks=chunks,
-                dimension_separator="/",
             )
 
     def place_tile(
@@ -501,10 +524,36 @@ class Stitcher:
             )
 
         # Configure storage options with optimal chunking
+        # Detect zarr version and configure compression accordingly
+        zarr_major_version = int(zarr.__version__.split('.')[0])
+        
+        if zarr_major_version >= 3:
+            # zarr v3: use codecs
+            if self.params.output_compression == "none":
+                codecs_list = None
+            else:  # "default"
+                try:
+                    codecs_list = [zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")]
+                except AttributeError:
+                    codecs_list = None
+            compressor_v2 = None
+        else:
+            # zarr v2: use compressor
+            codecs_list = None
+            if self.params.output_compression == "none":
+                compressor_v2 = None
+            else:  # "default"
+                try:
+                    from numcodecs import Blosc
+                    compressor_v2 = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)
+                except ImportError:
+                    compressor_v2 = None
+        
         storage_opts = {
             "chunks": self.computed_parameters.chunks,
-            "compressor": self.params.output_compression,
         }
+        if zarr_major_version < 3 and compressor_v2 is not None:
+            storage_opts["compressor"] = compressor_v2
 
         if isinstance(stitched_region, zarr.Array):
             # We already stored the higest resolution version it its target
@@ -518,17 +567,30 @@ class Stitcher:
 
         with debug_timing("write image data pyramid"):
             for pyramid_idx in range(start_index, len(pyramid)):
-                da.to_zarr(
-                    arr=pyramid[pyramid_idx],
-                    url=root.store,
-                    component=str(pathlib.Path(root.path) / str(pyramid_idx)),
-                    storage_options=storage_opts,
-                    compressor=storage_opts.get(
-                        "compressor", zarr.storage.default_compressor
-                    ),
-                    dimension_separator="/",
-                    compute=True,
-                )
+                # Write to zarr array - compatible with both v2 and v3
+                array_name = str(pyramid_idx)
+                
+                if zarr_major_version >= 3:
+                    # zarr v3: use create_array with compressors parameter
+                    arr = root.create_array(
+                        name=array_name,
+                        shape=pyramid[pyramid_idx].shape,
+                        dtype=pyramid[pyramid_idx].dtype,
+                        chunks=storage_opts["chunks"],
+                        compressors=codecs_list if codecs_list else None,
+                    )
+                else:
+                    # zarr v2: use zeros or create_dataset with compressor parameter
+                    arr = root.zeros(
+                        name=array_name,
+                        shape=pyramid[pyramid_idx].shape,
+                        dtype=pyramid[pyramid_idx].dtype,
+                        chunks=storage_opts["chunks"],
+                        compressor=storage_opts.get("compressor"),
+                    )
+                
+                # Store the dask array data into the zarr array
+                da.store(pyramid[pyramid_idx], arr, compute=True)
                 datasets.append({"path": str(pyramid_idx)})
 
         fmt = ome_zarr.format.CurrentFormat()
@@ -612,16 +674,44 @@ class Stitcher:
         self.paths.output_folder.mkdir(exist_ok=True, parents=True)
 
         if self.params.apply_flatfield:
-            # either load an existing manifest…
+            # Check if flatfields were already computed (e.g., by registration)
+            acquisition_folder = pathlib.Path(self.params.input_folder)
+            auto_flatfield_manifest = acquisition_folder / "flatfields" / "flatfield_manifest.json"
+            
+            logging.info(f"Flatfield loading: params.flatfield_manifest={self.params.flatfield_manifest}, auto_path={auto_flatfield_manifest}, exists={auto_flatfield_manifest.exists()}")
+            
+            # Priority: explicit manifest > auto-discovered > compute new
             if self.params.flatfield_manifest:
+                # User explicitly specified a manifest
                 from .flatfield_utils import load_flatfield_correction
-
+                logging.info(f"Loading flatfields from explicit manifest: {self.params.flatfield_manifest}")
                 self.computed_parameters.flatfields = load_flatfield_correction(
                     self.params.flatfield_manifest,
                     self.computed_parameters,
                 )
-            # …or compute afresh
-            else:
+            elif auto_flatfield_manifest.exists():
+                # Flatfields exist from previous computation (e.g., registration)
+                from .flatfield_utils import load_flatfield_correction
+                logging.info(f"Loading existing flatfields from: {auto_flatfield_manifest}")
+                try:
+                    loaded_flatfields = load_flatfield_correction(
+                        auto_flatfield_manifest,
+                        self.computed_parameters,
+                    )
+                    if loaded_flatfields:
+                        self.computed_parameters.flatfields = loaded_flatfields
+                        logging.info("Successfully loaded existing flatfields")
+                    else:
+                        logging.warning("Flatfield manifest exists but no valid flatfields loaded. Computing new ones.")
+                        self.computed_parameters.flatfields = None
+                except Exception as e:
+                    logging.warning(f"Failed to load existing flatfields: {e}. Computing new ones.")
+                    # Fall through to compute new flatfields
+                    self.computed_parameters.flatfields = None
+            
+            # Compute flatfields if not loaded
+            if not self.computed_parameters.flatfields:
+                logging.info("Computing new flatfield corrections")
                 self.computed_parameters.flatfields = (
                     flatfield_correction.compute_flatfield_correction(
                         self.computed_parameters,
@@ -632,8 +722,6 @@ class Stitcher:
                 # Save the computed flatfields to the acquisition folder
                 if self.computed_parameters.flatfields:
                     from .flatfield_utils import save_flatfield_correction
-                    
-                    acquisition_folder = pathlib.Path(self.params.input_folder)
                     flatfield_dir = acquisition_folder / "flatfields"
                     
                     try:

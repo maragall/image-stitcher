@@ -10,10 +10,10 @@ import numpy.typing as npt
 
 # Array type aliases
 NumArray = npt.NDArray[Any]
-FloatArray = npt.NDArray[np.float_]
-IntArray = npt.NDArray[np.int_]
+FloatArray = npt.NDArray[np.float64]
+IntArray = npt.NDArray[np.int64]
 BoolArray = npt.NDArray[np.bool_]
 
 # Numeric type aliases
-Int = Union[int, np.int_]
-Float = Union[float, np.float_]
+Int = Union[int, np.int64]
+Float = Union[float, np.float64]
