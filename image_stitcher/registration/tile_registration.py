@@ -494,7 +494,7 @@ def select_best_registration_channel(
     return best_channel
 
 
-def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 3e3) -> bool:
+def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2e3) -> bool:
     """Check if edge strip is featureless (dust speckles only, no tissue).
     
     Checks only the edge region being registered, not the full tile.
@@ -502,7 +502,7 @@ def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 3e3) -> bo
     
     Args:
         edge: 2D edge strip array (e.g., 2048x195)
-        variance_threshold: Variance threshold (default 3e3 - lowered to accept more edges)
+        variance_threshold: Variance threshold (default 2e3 - lowered to accept more edges)
         
     Returns:
         True if featureless (skip registration), False otherwise
