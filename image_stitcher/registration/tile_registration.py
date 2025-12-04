@@ -494,7 +494,7 @@ def select_best_registration_channel(
     return best_channel
 
 
-def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2.5e3) -> bool:
+def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2e3) -> bool:
     """Check if edge strip is featureless (dust speckles only, no tissue).
     
     Checks only the edge region being registered, not the full tile.
@@ -502,7 +502,7 @@ def is_edge_featureless(edge: np.ndarray, variance_threshold: float = 2.5e3) -> 
     
     Args:
         edge: 2D edge strip array (e.g., 2048x195)
-        variance_threshold: Variance threshold (default 2.5e3 - lowered to accept more edges)
+        variance_threshold: Variance threshold (default 2e3 - lowered to accept more edges)
         
     Returns:
         True if featureless (skip registration), False otherwise
@@ -1227,8 +1227,7 @@ def register_tiles(
     z_slice_to_keep: Optional[int] = 0,
     tensor_backend_engine: Optional[str] = None,
     flatfield_corrections: Optional[Dict[int, np.ndarray]] = None,
-    registration_channel: int = 0,
-    skip_backup: bool = False
+    registration_channel: int = 0
 ) -> Union[Tuple[pd.DataFrame, dict], pd.DataFrame, Dict[int, pd.DataFrame]]:
     """Unified entry point for tile registration.
     
@@ -1246,7 +1245,6 @@ def register_tiles(
         tensor_backend_engine: Preferred backend ('cupy', 'torch', 'numpy')
         flatfield_corrections: Precomputed flatfield corrections
         registration_channel: Channel to use for registration
-        skip_backup: Skip creating backup of coordinates file
         
     Returns:
         Depends on mode:
@@ -1353,7 +1351,6 @@ def register_tiles(
             overlap_diff_threshold=overlap_diff_threshold,
             pou=pou,
             ncc_threshold=ncc_threshold,
-            skip_backup=skip_backup,
             z_slice_for_registration=z_slice_to_keep,
             edge_width=edge_width,
             tensor_backend_engine=tensor_backend_engine,
@@ -1983,6 +1980,30 @@ def read_coordinates_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
     """
     return pd.read_csv(csv_path)
 
+
+def get_coordinates_path(image_directory: Path, timepoint: str = "0") -> Path:
+    """Get coordinates file path, preferring registered over original.
+    
+    Parameters
+    ----------
+    image_directory : Path
+        Root directory containing image data
+    timepoint : str
+        Timepoint identifier (default: "0")
+        
+    Returns
+    -------
+    Path
+        Path to coordinates file (registered if available, else original)
+    """
+    # Priority 1: registered coordinates
+    registered = image_directory / "registered_coordinates" / f"{timepoint}_coordinates.csv"
+    if registered.exists():
+        return registered
+    
+    # Priority 2: original coordinates in timepoint folder
+    return image_directory / timepoint / "coordinates.csv"
+
 def read_tiff_images_for_region(
     directory: Union[str, Path], 
     pattern: str,
@@ -2557,7 +2578,6 @@ def register_and_update_coordinates(
     overlap_diff_threshold: float = 10,
     pou: float = 3,
     ncc_threshold: float = 0.5,
-    skip_backup: bool = False,
     z_slice_for_registration: Optional[int] = 0,
     edge_width: int = DEFAULT_EDGE_WIDTH,
     tensor_backend_engine: Optional[str] = None,
@@ -2583,8 +2603,6 @@ def register_and_update_coordinates(
         Percent overlap uncertainty
     ncc_threshold : float
         Normalized cross correlation threshold
-    skip_backup : bool
-        Whether to skip creating a backup of the coordinates file
     z_slice_for_registration : Optional[int]
         Which z-slice to use for registration (default: 0)
     edge_width : int
@@ -2593,8 +2611,6 @@ def register_and_update_coordinates(
         Preferred tensor backend engine ('cupy', 'torch', 'numpy', None for auto)
     flatfield_corrections : Optional[Dict[int, np.ndarray]]
         Precomputed flatfield corrections indexed by channel
-    flatfield_manifest : Optional[Path]
-        Path to flatfield manifest file to load corrections
         
     Returns
     -------
@@ -2603,28 +2619,19 @@ def register_and_update_coordinates(
     """
     image_directory = Path(image_directory)
     csv_path = Path(csv_path)
-    output_csv_path = Path(output_csv_path)
     
-    # Create original_coordinates directory if it doesn't exist
-    original_coords_dir = image_directory / "original_coordinates"
-    original_coords_dir.mkdir(exist_ok=True)
-    
-    # Initialize timepoint for backup filename (fixes the original bug)
-    timepoint = "unknown"
-    timepoint_dir = None  # Initialize for later use
-    
-    # Look for coordinates.csv in the timepoint directory
+    # Detect timepoint
+    timepoint = "0"
     timepoint_dir = image_directory / "0"
     if timepoint_dir.exists():
         coords_file = timepoint_dir / "coordinates.csv"
         if coords_file.exists():
             csv_path = coords_file
-            print(f"Found coordinates file at: {csv_path}")
-            # Get timepoint from the subdirectory name (e.g., "0" from the path)
             timepoint = timepoint_dir.name
+            print(f"Found coordinates file at: {csv_path}")
     
-    # Validate that the coordinates file actually exists
-    if not Path(csv_path).exists():
+    # Validate coordinates file exists
+    if not csv_path.exists():
         raise FileNotFoundError(
             f"Stage coordinates file not found.\n\n"
             f"Expected location: {csv_path}\n\n"
@@ -2635,13 +2642,6 @@ def register_and_update_coordinates(
         )
     
     print(f"Using coordinates file: {csv_path}")
-    
-    # Create backup of original coordinates
-    if not skip_backup:
-        backup_path = original_coords_dir / f"original_coordinates_{timepoint}.csv"
-        import shutil
-        shutil.copy2(csv_path, backup_path)
-        print(f"Created backup of original coordinates at: {backup_path}")
     
     # Read coordinates
     coords_df = read_coordinates_csv(csv_path)
@@ -2900,9 +2900,12 @@ def register_and_update_coordinates(
                 f"Check NCC threshold, image quality, or tile overlap."
             )
     
-    # Save updated coordinates to the output path
-    updated_coords.to_csv(output_csv_path, index=False)
-    print(f"Saved updated coordinates to: {output_csv_path}")
+    # Save registered coordinates to dedicated folder
+    registered_dir = image_directory / "registered_coordinates"
+    registered_dir.mkdir(exist_ok=True)
+    output_path = registered_dir / f"{timepoint}_coordinates.csv"
+    updated_coords.to_csv(output_path, index=False)
+    print(f"Saved registered coordinates to: {output_path}")
     
     return updated_coords
 
@@ -2950,10 +2953,6 @@ def process_multiple_timepoints(
     if not base_directory.is_dir():
         raise ValueError(f"Base directory does not exist: {base_directory}")
         
-    # Create original_coordinates directory
-    backup_dir = base_directory / "original_coordinates"
-    backup_dir.mkdir(exist_ok=True)
-        
     # Find all timepoint directories (numbered subdirectories)
     timepoint_dirs = sorted([d for d in base_directory.iterdir() if d.is_dir() and d.name.isdigit()])
     if not timepoint_dirs:
@@ -2969,19 +2968,15 @@ def process_multiple_timepoints(
         timepoint = int(tp_dir.name)
         print(f"\nProcessing timepoint {timepoint}")
         
-        # Find coordinates.csv in timepoint directory
+        # Find coordinates.csv in timepoint directory (read-only source)
         tp_coords = list(tp_dir.glob("coordinates.csv"))
         if not tp_coords:
             print(f"Warning: No coordinates.csv found in timepoint {timepoint}, skipping")
             continue
         coords_csv = tp_coords[0]
         
-        # Create backup of this timepoint's coordinates
-        backup_path = backup_dir / f"original_coordinates_{timepoint}.csv"
-        if not backup_path.exists():
-            print(f"Creating backup of timepoint {timepoint} coordinates at {backup_path}")
-            import shutil
-            shutil.copy2(coords_csv, backup_path)
+        # Read original coordinates before registration (for delta computation)
+        original_coords = pd.read_csv(coords_csv)
             
         try:
             # For first timepoint or when register_once=False, compute registration normally
@@ -2989,12 +2984,11 @@ def process_multiple_timepoints(
                 updated_coords = register_and_update_coordinates(
                     image_directory=base_directory,  # Use base directory instead of timepoint directory
                     csv_path=coords_csv,
-                    output_csv_path=coords_csv,  # Overwrite the original
+                    output_csv_path=coords_csv,
                     channel_pattern=None,  # Auto-detect
                     overlap_diff_threshold=overlap_diff_threshold,
                     pou=pou,
                     ncc_threshold=ncc_threshold,
-                    skip_backup=True,  # Skip backup since we already made one
                     z_slice_for_registration=0,
                     edge_width=edge_width,
                     tensor_backend_engine=tensor_backend_engine,
@@ -3003,7 +2997,6 @@ def process_multiple_timepoints(
                 
                 # Store deltas from first timepoint for later reuse
                 if i == 0 and register_once and len(timepoint_dirs) > 1:
-                    original_coords = pd.read_csv(backup_path)
                     first_timepoint_deltas = {
                         'dx': (updated_coords['x (mm)'] - original_coords['x (mm)']).values,
                         'dy': (updated_coords['y (mm)'] - original_coords['y (mm)']).values
@@ -3012,11 +3005,16 @@ def process_multiple_timepoints(
             else:
                 # For subsequent timepoints when register_once=True, apply first timepoint's deltas
                 print(f"Applying registration from first timepoint (register_once mode)")
-                original_coords = pd.read_csv(backup_path)
                 updated_coords = original_coords.copy()
                 updated_coords['x (mm)'] = original_coords['x (mm)'] + first_timepoint_deltas['dx']
                 updated_coords['y (mm)'] = original_coords['y (mm)'] + first_timepoint_deltas['dy']
-                updated_coords.to_csv(coords_csv, index=False)
+                
+                # Save to registered_coordinates folder
+                registered_dir = base_directory / "registered_coordinates"
+                registered_dir.mkdir(exist_ok=True)
+                output_path = registered_dir / f"{timepoint}_coordinates.csv"
+                updated_coords.to_csv(output_path, index=False)
+                print(f"Saved registered coordinates to: {output_path}")
                 
             results[timepoint] = updated_coords
             print(f"Successfully processed timepoint {timepoint}")
