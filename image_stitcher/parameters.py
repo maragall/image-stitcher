@@ -410,8 +410,12 @@ class StitchingComputedParameters:
         
         # Iterate over each timepoint
         for timepoint in self.timepoints:
+            from .registration.tile_registration import get_coordinates_path
+            
+            # Get coordinates path (registered or original)
+            coordinates_path = get_coordinates_path(input_path, str(timepoint))
+            
             timepoint_folder = input_path / str(timepoint)
-            coordinates_path = timepoint_folder / "coordinates.csv"
             
             # Determine where to look for OME-TIFF files
             if use_ome_tiff_dir:
@@ -591,8 +595,10 @@ class StitchingComputedParameters:
 
         # Iterate over each timepoint
         for timepoint in self.timepoints:
+            from .registration.tile_registration import get_coordinates_path
+            
             image_folder = input_path / str(timepoint)
-            coordinates_path = image_folder / "coordinates.csv"
+            coordinates_path = get_coordinates_path(input_path, str(timepoint))
 
             logging.info(
                 f"Processing timepoint {timepoint}, image folder: {image_folder}"
@@ -733,8 +739,10 @@ class StitchingComputedParameters:
         
         # Iterate over each timepoint - SAME AS ORIGINAL
         for timepoint in self.timepoints:
+            from .registration.tile_registration import get_coordinates_path
+            
             image_folder = input_path / str(timepoint)
-            coordinates_path = image_folder / "coordinates.csv"
+            coordinates_path = get_coordinates_path(input_path, str(timepoint))
             
             logging.info(f"Processing timepoint {timepoint}, image folder: {image_folder}")
             
