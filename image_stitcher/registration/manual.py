@@ -1159,17 +1159,9 @@ def launch_fixed_registration(input_directory: str) -> bool:
         # Use first timepoint for alignment dialog
         first_tp_name, first_coords_file = timepoint_coords[0]
         
-        # Always start from backup coordinates if available
-        original_coords_dir = input_path / "original_coordinates"
-        backup_file = original_coords_dir / f"original_coordinates_{first_tp_name}.csv"
-        
-        if backup_file.exists():
-            print(f"DEBUG: REVERTED TO ORIGINAL COORDINATES FILE: {backup_file}")
-            print(f"DEBUG: Using backup coordinates from {backup_file}")
-            coords_df = read_coordinates_csv(backup_file)
-        else:
-            print(f"DEBUG: No backup found, using current coordinates from {first_coords_file}")
-            coords_df = read_coordinates_csv(first_coords_file)
+        # Always read from original coordinates (read-only source)
+        coords_df = read_coordinates_csv(first_coords_file)
+        print(f"DEBUG: Using coordinates from {first_coords_file}")
         
         # Get first alignment triplet efficiently
         image_dir = first_coords_file.parent if first_tp_name != "single" else input_path
@@ -1183,24 +1175,15 @@ def launch_fixed_registration(input_directory: str) -> bool:
             print(f"DEBUG: Using pixel size: {pixel_size_um:.4f} um/pixel")
             print(f"DEBUG: Applying shifts to {len(timepoint_coords)} timepoint(s)")
             
-            # Create central backup directory (like tile_registration.py)
-            original_coords_dir = input_path / "original_coordinates"
-            original_coords_dir.mkdir(exist_ok=True)
+            # Create registered_coordinates directory for output
+            registered_dir = input_path / "registered_coordinates"
+            registered_dir.mkdir(exist_ok=True)
             
-            # Apply shifts to ALL timepoints using existing backup system
+            # Apply shifts to ALL timepoints
             for tp_name, coords_file in timepoint_coords:
                 print(f"DEBUG: Processing timepoint {tp_name}")
                 
-                # Create backup in central location (like tile_registration.py does)
-                backup_path = original_coords_dir / f"original_coordinates_{tp_name}.csv"
-                if not backup_path.exists():
-                    import shutil
-                    shutil.copy2(coords_file, backup_path)
-                    print(f"DEBUG: Created backup at {backup_path}")
-                else:
-                    print(f"DEBUG: Backup already exists at {backup_path}")
-                
-                # Read coordinates for this timepoint
+                # Read coordinates from original location (read-only)
                 tp_coords_df = read_coordinates_csv(coords_file)
                 
                 # TODO: Fixed shift correction disabled - requires stage motor characterization
@@ -1210,9 +1193,10 @@ def launch_fixed_registration(input_directory: str) -> bool:
                 print(f"  Requested shifts: h={dialog.h_shift_px:.1f}px, v={dialog.v_shift_px:.1f}px")
                 updated_coords = tp_coords_df.copy()
                 
-                # Save updated coordinates
-                updated_coords.to_csv(coords_file, index=False)
-                print(f"DEBUG: Updated coordinates saved to {coords_file}")
+                # Save registered coordinates to dedicated folder
+                output_path = registered_dir / f"{tp_name}_coordinates.csv"
+                updated_coords.to_csv(output_path, index=False)
+                print(f"DEBUG: Saved registered coordinates to {output_path}")
             
             print(f"DEBUG: Fixed registration applied to all {len(timepoint_coords)} timepoint(s)")
             return True
